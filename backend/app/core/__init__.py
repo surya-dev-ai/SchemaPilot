@@ -1,0 +1,1 @@
+"""Configuration and safety checks."""

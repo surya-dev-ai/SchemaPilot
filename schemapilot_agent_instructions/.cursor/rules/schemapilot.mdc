@@ -1,0 +1,24 @@
+---
+description: Core product, safety, and implementation rules for SchemaPilot
+alwaysApply: true
+---
+
+# SchemaPilot Cursor Rule
+
+Read `instructions.md`, `IMPLEMENTATION_PLAN.md`, and `SECURITY.md` before substantial work.
+
+- Product: AI-powered natural-language PostgreSQL migration planning and safety validation.
+- Principle: **AI proposes. The system verifies. The user approves.**
+- Inspect repository conventions before changing files; do not replace architecture wholesale.
+- Work in small vertical slices and verify each slice.
+- Add tests for behavior and safety boundaries. Never remove/loosen tests to make them pass.
+- LLM output is untrusted structured proposal data. Validate strictly.
+- Risk level and execution gates are deterministic backend responsibilities.
+- Never execute raw LLM output or uploaded SQL against a target database.
+- Use disposable isolated PostgreSQL sandbox for migration execution and rollback tests.
+- Target apply is disabled by default; require authorization, policy checks, passing required validations, and explicit approval tied to the exact artifact checksum.
+- Unknown/unsupported operation or uncertain isolation must fail closed.
+- Never expose secrets in client code, logs, prompts, or committed files.
+- Do not fabricate AI output, test results, validation evidence, or success states.
+- Use Python type hints, typed API schemas, clear errors, focused modules, and accessible React/TypeScript UI.
+- Run relevant tests, lint, and type checks when available; report exact commands and outcomes.
