@@ -13,11 +13,13 @@ Each persisted workflow references a generated artifact by `migration_id` and `a
 - `eligible_for_review`, `fully_reversible`, `rollback_status`, and `report_stale`
 - approval bindings and audit events
 
-`generated` does not mean `applied`. `eligible_for_review` does not mean `approved`. `approved`/`recorded` does not mean `applied`. `not_verified` is never rewritten as success because PostgreSQL is unavailable. `fully_reversible` is only true for `exact_restoration`.
+`generated` does not mean `applied`. `eligible_for_review` does not mean `approved`. For an explicitly sandbox-only destructive column artifact, a passed sandbox run, recorded migration downgrade outcome, and verified pre-migration checkpoint restoration may make the evidence eligible for human review even though the risk finding remains policy-blocked for target use. The downgrade result and snapshot recovery result are shown separately. Checkpoints are PostgreSQL clones on the same cluster and prove sandbox recovery only, not independent or production backup capability. Sandbox rollback evidence does not record human approval or authorize production apply: approval requires a separate authenticated approver, and target execution remains disabled and unimplemented. `approved`/`recorded` does not mean `applied`. `not_verified` is never rewritten as success because PostgreSQL is unavailable. `fully_reversible` describes the migration downgrade only; it is not a statement about snapshot recovery.
+
+The sandbox-validation route creates the pre-validation checkpoint session. It operates on the current `schemapilot_sandbox` schema without dropping or reseeding it. The recovery endpoint must receive that session ID and restores the sandbox from its original checkpoint; it does not run a migration downgrade. It stores a separate report under `backend/artifacts/rollback-evidence/` for that migration/session pair. Safety-report generation and workflow persistence must receive the same session ID; they only load that matching evidence and do not rerun recovery or mutate PostgreSQL. If no matching evidence exists, the report remains incomplete and ineligible for review.
 
 ## Alembic
 
-Revision `20261015_0001` creates the metadata tables. It runs only through the existing guarded Alembic path:
+Revision `20261015_0001` creates the metadata tables. Revision `20261029_0002` adds nullable `owner_identity` and `visibility` (default `shared`) to support private and shared team workflows. Apply both through the existing guarded Alembic path before enabling OIDC against an existing app database:
 
 - `SCHEMAPILOT_ALLOW_APP_MIGRATIONS=true`
 - `SCHEMAPILOT_APP_DATABASE_URL` points at the application database
@@ -29,7 +31,7 @@ API startup does not create tables or run Alembic.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| POST | `/api/v1/sources/bookstore-demo/artifacts/{migration_id}/workflows` | Build the Phase 8 safety report and persist it |
+| POST | `/api/v1/sources/sandbox/artifacts/{migration_id}/workflows` | Build the Phase 8 safety report and persist it |
 | GET | `/api/v1/workflows` | List persisted workflows |
 | GET | `/api/v1/workflows/{workflow_id}` | Workflow detail, report, approvals, audit |
 | POST | `/api/v1/workflows/{workflow_id}/approvals` | Record an approval binding |
@@ -37,7 +39,7 @@ API startup does not create tables or run Alembic.
 
 Request bodies:
 
-- Persist: `{ "request": string, "confirm": true, "use_llm"?: boolean }`
+- Persist: `{ "request": string, "confirm": true, "use_llm"?: boolean, "visibility"?: "shared" | "private" }`
 - Approval: `{ "target_identity": string, "confirm": true }`
 
 `use_llm` defaults to false. When true, the same assisted planning path used for plans/reports is used so artifact checksum matching stays consistent. Interpretation path and provider status are stored in `plan_json` and in the `workflow_persisted` audit detail. API keys are never persisted.
@@ -54,7 +56,8 @@ An approval record stores `artifact_checksum`, `report_checksum`, and `target_id
 - the workflow is not eligible for review
 - blockers or missing evidence remain
 - rollback is not `exact_restoration` or `partial_restoration`
+- the sandbox checkpoint is missing, invalid, or not fully restored and verified
 - the target identity names the source, sandbox, or application database
 - the supplied artifact or report checksum does not match the workflow
 
-Authentication is not implemented as a login provider. Approvals therefore fail closed with `authentication_unavailable` until a real principal can be verified. Target execution stays disabled. See `docs/acceptance.md`.
+OIDC sign-in and role checks are implemented but remain disabled by default until a provider is configured. In authenticated mode, Engineers/Admins can propose and save workflows; Approvers/Admins can record approvals; self-approval is rejected. Private workflows are visible only to their owner. Shared workflows are visible to members of the configured team group and Admins. Target execution stays disabled. See `docs/authentication.md` for provider setup and the role matrix.

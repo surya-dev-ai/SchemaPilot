@@ -10,6 +10,7 @@ import {
   listSources,
   listWorkflows,
   persistWorkflow,
+  runDowngrade,
   runRollback,
   runSandbox,
 } from "./client";
@@ -63,12 +64,12 @@ describe("Phase 7–9 API path contracts", () => {
       assumptions: [],
       clarification_needed: false,
       clarification_questions: [],
-      source_id: "bookstore-demo",
+      source_id: "sandbox",
       schema_fingerprint: "fp",
     });
     await createPlan("Add nickname", true);
     expect(fetch).toHaveBeenLastCalledWith(
-      "/api/v1/sources/bookstore-demo/plans",
+      "/api/v1/sources/sandbox/plans",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({ request: "Add nickname", use_llm: true }),
@@ -82,12 +83,12 @@ describe("Phase 7–9 API path contracts", () => {
       applied: false,
       module_identity: "sp0123456789ab_add_nickname",
       sql_preview: "-- preview",
-      source_id: "bookstore-demo",
+      source_id: "sandbox",
       schema_fingerprint: "fp",
     });
     await createArtifact("Add nickname", false);
     expect(fetch).toHaveBeenLastCalledWith(
-      "/api/v1/sources/bookstore-demo/artifacts",
+      "/api/v1/sources/sandbox/artifacts",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({ request: "Add nickname", use_llm: false }),
@@ -97,7 +98,7 @@ describe("Phase 7–9 API path contracts", () => {
     stubJson({ result: "passed", upgrade_applied: true, migration_id: "sp0123456789ab" });
     await runSandbox("sp0123456789ab", true);
     expect(fetch).toHaveBeenLastCalledWith(
-      "/api/v1/sources/bookstore-demo/artifacts/sp0123456789ab/sandbox",
+      "/api/v1/sources/sandbox/artifacts/sp0123456789ab/sandbox",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({ confirm: true }),
@@ -108,13 +109,29 @@ describe("Phase 7–9 API path contracts", () => {
       migration_id: "sp0123456789ab",
       status: "partial_restoration",
       fully_reversible: false,
+      snapshot_recovery: null,
     });
-    await runRollback("sp0123456789ab", true);
+    await runRollback("sp0123456789ab", true, "a".repeat(32));
     expect(fetch).toHaveBeenLastCalledWith(
-      "/api/v1/sources/bookstore-demo/artifacts/sp0123456789ab/rollback",
+      "/api/v1/sources/sandbox/artifacts/sp0123456789ab/rollback",
       expect.objectContaining({
         method: "POST",
-        body: JSON.stringify({ confirm: true }),
+        body: JSON.stringify({ confirm: true, snapshot_session_id: "a".repeat(32) }),
+      }),
+    );
+
+    stubJson({
+      migration_id: "sp0123456789ab",
+      status: "partial_restoration",
+      downgrade_executed: true,
+      snapshot_recovery: null,
+    });
+    await runDowngrade("sp0123456789ab", true, "a".repeat(32));
+    expect(fetch).toHaveBeenLastCalledWith(
+      "/api/v1/sources/sandbox/artifacts/sp0123456789ab/downgrade",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ confirm: true, snapshot_session_id: "a".repeat(32) }),
       }),
     );
 
@@ -123,7 +140,7 @@ describe("Phase 7–9 API path contracts", () => {
       interpreted_intent: "x",
       operations: [],
       assumptions: [],
-      source_id: "bookstore-demo",
+      source_id: "sandbox",
       schema_fingerprint: "fp",
       migration_id: "sp0123456789ab",
       artifact_checksum: "sha256:a",
@@ -131,6 +148,7 @@ describe("Phase 7–9 API path contracts", () => {
       risk_findings: [],
       sandbox: null,
       rollback_status: "not_verified",
+      snapshot_recovery: null,
       data_loss_limitations: [],
       missing_evidence: [],
       blocking_reasons: [],
@@ -141,7 +159,7 @@ describe("Phase 7–9 API path contracts", () => {
     });
     await createSafetyReport("sp0123456789ab", "Add nickname", true, true);
     expect(fetch).toHaveBeenLastCalledWith(
-      "/api/v1/sources/bookstore-demo/artifacts/sp0123456789ab/report",
+      "/api/v1/sources/sandbox/artifacts/sp0123456789ab/report",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({ request: "Add nickname", confirm: true, use_llm: true }),
@@ -152,12 +170,13 @@ describe("Phase 7–9 API path contracts", () => {
   it("persists workflows and loads history, detail, approvals, and audit", async () => {
     stubJson({
       id: "wf-1",
-      source_id: "bookstore-demo",
+      source_id: "sandbox",
       migration_id: "sp0123456789ab",
       artifact_checksum: "sha256:a",
       artifact_status: "generated",
       artifact_applied: false,
       schema_fingerprint: "fp",
+      visibility: "shared",
       state: "blocked",
       report_checksum: "sha256:r",
       evidence_fingerprint: "sha256:e",
@@ -170,7 +189,7 @@ describe("Phase 7–9 API path contracts", () => {
         interpreted_intent: "x",
         operations: [],
         assumptions: [],
-        source_id: "bookstore-demo",
+        source_id: "sandbox",
         schema_fingerprint: "fp",
         migration_id: "sp0123456789ab",
         artifact_checksum: "sha256:a",
@@ -178,6 +197,7 @@ describe("Phase 7–9 API path contracts", () => {
         risk_findings: [],
         sandbox: null,
         rollback_status: "not_verified",
+        snapshot_recovery: null,
         data_loss_limitations: [],
         missing_evidence: ["sandbox"],
         blocking_reasons: [],
@@ -193,10 +213,10 @@ describe("Phase 7–9 API path contracts", () => {
     });
     await persistWorkflow("sp0123456789ab", "Add nickname", true, false);
     expect(fetch).toHaveBeenLastCalledWith(
-      "/api/v1/sources/bookstore-demo/artifacts/sp0123456789ab/workflows",
+      "/api/v1/sources/sandbox/artifacts/sp0123456789ab/workflows",
       expect.objectContaining({
         method: "POST",
-        body: JSON.stringify({ request: "Add nickname", confirm: true, use_llm: false }),
+        body: JSON.stringify({ request: "Add nickname", confirm: true, use_llm: false, visibility: "shared" }),
       }),
     );
 
@@ -215,6 +235,7 @@ describe("Phase 7–9 API path contracts", () => {
       artifact_status: "generated",
       artifact_applied: false,
       schema_fingerprint: "fp",
+      visibility: "shared",
       state: "blocked",
       report_checksum: "sha256:r",
       evidence_fingerprint: "sha256:e",
@@ -235,6 +256,7 @@ describe("Phase 7–9 API path contracts", () => {
         risk_findings: [],
         sandbox: null,
         rollback_status: "not_verified",
+        snapshot_recovery: null,
         data_loss_limitations: [],
         missing_evidence: [],
         blocking_reasons: [],

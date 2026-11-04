@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from difflib import get_close_matches
 from typing import TYPE_CHECKING
 
 from app.schemas.domain import SchemaSnapshot
@@ -183,7 +184,7 @@ def _validate_llm_operation(operation: LlmOperationDraft, index: _Index, draft: 
             _error(draft, "invalid_identifier", "Destructive operation needs a table.", None)
             return
         if table not in index.tables:
-            _error(draft, "unknown_table", f"Table {table} does not exist.", table)
+            _unknown_table_error(table, index, draft)
             return
         draft.operations.append(
             _operation(
@@ -694,6 +695,10 @@ def _parse_add_column(text: str, index: _Index, draft: _Draft) -> bool:
 def _destructive_operation(text: str, index: _Index, draft: _Draft) -> PlanOperation | None:
     table_match = re.search(rf"\bdrop\s+table\s+(?:[a-z_]+\.)?({_IDENTIFIER})\b", text)
     named_table = re.search(rf"\bdrop\s+(?:the\s+)?({_IDENTIFIER})\s+table\b", text)
+    spoken_drop_column = re.search(
+        rf"\bdrop\s+(?:the\s+)?column[\s,]+(.+?)\s+(?:from|on)\s+({_IDENTIFIER})\b",
+        text,
+    )
     column_match = re.search(
         rf"\b(?:drop|remove|delete)\s+(?:the\s+)?(?:column\s+)?({_IDENTIFIER})\s+column\s+"
         rf"(?:from|on)\s+({_IDENTIFIER})\b",
@@ -709,7 +714,7 @@ def _destructive_operation(text: str, index: _Index, draft: _Draft) -> PlanOpera
         table = matched.group(1)
         draft.destructive = True
         if table not in index.tables:
-            _error(draft, "unknown_table", f"Table {table} does not exist.", table)
+            _unknown_table_error(table, index, draft)
             return None
         return _operation(
             kind="destructive",
@@ -717,6 +722,34 @@ def _destructive_operation(text: str, index: _Index, draft: _Draft) -> PlanOpera
             table=table,
             destructive=True,
         )
+    if spoken_drop_column is not None:
+        raw_column, table = spoken_drop_column.groups()
+        draft.destructive = True
+        if not _known_table(table, index, draft):
+            return None
+        words = re.findall(_IDENTIFIER, raw_column)
+        existing = index.tables[table]
+        candidates = {
+            "_".join(words[offset:])
+            for offset in range(len(words))
+            if "_".join(words[offset:]) in existing
+        }
+        if len(candidates) == 1:
+            column = next(iter(candidates))
+            return _operation(
+                kind="destructive",
+                summary=f"Dropping {table}.{column} is destructive and is not executed.",
+                table=table,
+                column=column,
+                destructive=True,
+            )
+        draft.questions.append(
+            (
+                "column",
+                f"Which single existing column on {table} should be dropped?",
+            )
+        )
+        return None
     match = drop_column or column_match
     if match is None:
         return None
@@ -829,7 +862,7 @@ def _one_table(text: str, index: _Index, draft: _Draft) -> str | None:
         if name not in index.tables and name not in _SKIP_NAMES
     ]
     if unknown:
-        _error(draft, "unknown_table", f"Table {unknown[0]} does not exist.", unknown[0])
+        _unknown_table_error(unknown[0], index, draft)
         return None
     found = _mentioned_tables(text, index)
     if len(found) == 1:
@@ -860,8 +893,18 @@ def _mentioned_tables(text: str, index: _Index) -> list[str]:
 def _known_table(table: str, index: _Index, draft: _Draft) -> bool:
     if table in index.tables:
         return True
-    _error(draft, "unknown_table", f"Table {table} does not exist.", table)
+    _unknown_table_error(table, index, draft)
     return False
+
+
+def _unknown_table_error(table: str, index: _Index, draft: _Draft) -> None:
+    """Reject unknown identifiers and suggest a close schema name when safe."""
+
+    matches = get_close_matches(table, index.tables, n=1, cutoff=0.72)
+    message = f"Table {table} does not exist."
+    if matches:
+        message += f" Did you mean {matches[0]}?"
+    _error(draft, "unknown_table", message, table)
 
 
 def _known_column(table: str, column: str, index: _Index, draft: _Draft) -> bool:

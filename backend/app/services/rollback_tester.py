@@ -14,6 +14,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError
 
 from app.core.config import (
+    DEMO_DATABASE_NAME,
     SANDBOX_DATABASE_NAME,
     SANDBOX_DATABASE_USER,
     Settings,
@@ -24,7 +25,12 @@ from app.db.session import create_sandbox_engine
 from app.demo.bookstore import EXPECTED_COUNTS
 from app.schemas.artifacts import MigrationArtifact
 from app.schemas.domain import SchemaSnapshot
-from app.schemas.rollback import BaselineEvidence, RollbackReport, RollbackStatus
+from app.schemas.rollback import (
+    BaselineEvidence,
+    RollbackReport,
+    RollbackStatus,
+    SnapshotRecoveryReport,
+)
 from app.schemas.sandbox import SandboxCheck, SandboxRun
 from app.services.migration_generator import ARTIFACTS_DIR
 from app.services.sandbox_manager import (
@@ -36,13 +42,24 @@ from app.services.sandbox_manager import (
     prepare_sandbox_baseline,
     run_sandbox,
 )
+from app.services.sandbox_snapshots import (
+    create_verified_checkpoint,
+    restore_verified_checkpoint,
+    sandbox_lifecycle_lock,
+)
 from app.services.schema_inspector import assemble_snapshot, load_catalog
+from app.services.source_manager import SANDBOX_SOURCE_ID
 from app.services.validator import parse_upgrade_sql
 
 _IDENTIFIER = r"[a-z_][a-z0-9_]*"
 _DROP_COLUMN = re.compile(
     rf'^ALTER TABLE "(?P<schema>{_IDENTIFIER})"\."(?P<table>{_IDENTIFIER})" '
     rf'DROP COLUMN "(?P<column>{_IDENTIFIER})";$'
+)
+_ADD_COLUMN = re.compile(
+    rf'^ALTER TABLE "(?P<schema>{_IDENTIFIER})"\."(?P<table>{_IDENTIFIER})" '
+    rf'ADD COLUMN "(?P<column>{_IDENTIFIER})" '
+    r'(?P<data_type>TEXT|INTEGER|BIGINT|BOOLEAN|TIMESTAMP WITH TIME ZONE) NULL;$'
 )
 _DROP_INDEX = re.compile(
     rf'^DROP INDEX "(?P<schema>{_IDENTIFIER})"\."(?P<index>{_IDENTIFIER})";$'
@@ -94,10 +111,12 @@ def classify_restoration(
 
     if not upgrade_passed or not evidence_complete or not downgrade_executed:
         return "not_verified"
-    if downgrade_failed or schema_matches is not True or data_restored is not True:
+    if downgrade_failed:
         return "failed"
     if data_loss:
         return "partial_restoration"
+    if schema_matches is not True or data_restored is not True:
+        return "failed"
     return "exact_restoration"
 
 
@@ -106,8 +125,41 @@ def run_rollback_test(
     migration_id: str,
     *,
     directory: Path | None = None,
+    preexisting_checkpoint: SnapshotRecoveryReport | None = None,
+    _lifecycle_lock_held: bool = False,
 ) -> RollbackReport:
     """Upgrade through the sandbox runner, then downgrade that same artifact."""
+
+    if _lifecycle_lock_held:
+        return _run_rollback_test_locked(
+            settings,
+            migration_id,
+            directory=directory,
+            preexisting_checkpoint=preexisting_checkpoint,
+        )
+    try:
+        with sandbox_lifecycle_lock(settings):
+            return _run_rollback_test_locked(
+                settings,
+                migration_id,
+                directory=directory,
+                preexisting_checkpoint=preexisting_checkpoint,
+            )
+    except OperationalError:
+        return _unverified(
+            migration_id,
+            _now(),
+            error="Sandbox database is unavailable.",
+        )
+
+
+def _run_rollback_test_locked(
+    settings: Settings,
+    migration_id: str,
+    *,
+    directory: Path | None = None,
+    preexisting_checkpoint: SnapshotRecoveryReport | None = None,
+) -> RollbackReport:
 
     started = _now()
     folder = directory or ARTIFACTS_DIR
@@ -117,35 +169,133 @@ def run_rollback_test(
         return _unverified(migration_id, started, error=exc.message)
     except (SandboxUnavailable, UnsafeDatabaseConfigurationError, OperationalError):
         return _unverified(migration_id, started, error="Sandbox database is unavailable.")
-    try:
-        baseline_snapshot = prepare_sandbox_baseline(settings)
-        evidence = read_baseline_evidence(settings, baseline_snapshot)
-        upgrade = run_sandbox(settings, migration_id, directory=folder)
-    except SandboxUnavailable:
+    preexisting = preexisting_checkpoint or create_verified_checkpoint(
+        settings, None, _lifecycle_lock_held=True
+    )
+    if preexisting.backup_status != "verified":
         return _unverified(
             migration_id,
             started,
             checksum=artifact.checksum,
             fingerprint=artifact.schema_fingerprint,
+            preexisting_sandbox_recovery=preexisting,
+            error=preexisting.error or "The pre-existing sandbox state could not be protected.",
+        )
+    try:
+        baseline_snapshot = prepare_sandbox_baseline(settings, _lifecycle_lock_held=True)
+        evidence = read_baseline_evidence(settings, baseline_snapshot)
+        checkpoint = create_verified_checkpoint(
+            settings,
+            baseline_snapshot.fingerprint,
+            _lifecycle_lock_held=True,
+        )
+        if checkpoint.backup_status != "verified":
+            original_restore = _safe_restore(settings, preexisting)
+            return _unverified(
+                migration_id,
+                started,
+                checksum=artifact.checksum,
+                fingerprint=artifact.schema_fingerprint,
+                snapshot_recovery=checkpoint,
+                preexisting_sandbox_recovery=original_restore,
+                error=checkpoint.error or "Sandbox checkpoint could not be verified.",
+            )
+        upgrade = run_sandbox(
+            settings,
+            migration_id,
+            directory=folder,
+            _lifecycle_lock_held=True,
+        )
+    except SandboxUnavailable:
+        restored_checkpoint = (
+            _safe_restore(settings, checkpoint)
+            if "checkpoint" in locals() and checkpoint.backup_status == "verified"
+            else None
+        )
+        original_restore = _safe_restore(settings, preexisting)
+        return _unverified(
+            migration_id,
+            started,
+            checksum=artifact.checksum,
+            fingerprint=artifact.schema_fingerprint,
+            snapshot_recovery=restored_checkpoint,
+            preexisting_sandbox_recovery=original_restore,
             error="Sandbox database is unavailable.",
         )
     except (SandboxRejected, UnsafeDatabaseConfigurationError) as exc:
         message = _rejected_message(exc)
+        restored_checkpoint = (
+            _safe_restore(settings, checkpoint)
+            if "checkpoint" in locals() and checkpoint.backup_status == "verified"
+            else None
+        )
+        original_restore = _safe_restore(settings, preexisting)
         return _unverified(
             migration_id,
             started,
             checksum=artifact.checksum,
             fingerprint=artifact.schema_fingerprint,
+            snapshot_recovery=restored_checkpoint,
+            preexisting_sandbox_recovery=original_restore,
             error=message,
         )
-    return downgrade_verified_upgrade(
-        settings,
-        migration_id,
-        folder,
-        upgrade,
-        evidence,
-        started=started,
+    except Exception:
+        restored_checkpoint = (
+            _safe_restore(settings, checkpoint)
+            if "checkpoint" in locals() and checkpoint.backup_status == "verified"
+            else None
+        )
+        original_restore = _safe_restore(settings, preexisting)
+        return _unverified(
+            migration_id,
+            started,
+            checksum=artifact.checksum,
+            fingerprint=artifact.schema_fingerprint,
+            snapshot_recovery=restored_checkpoint,
+            preexisting_sandbox_recovery=original_restore,
+            error="Sandbox workflow failed unexpectedly; recovery was attempted.",
+        )
+    try:
+        report = downgrade_verified_upgrade(
+            settings,
+            migration_id,
+            folder,
+            upgrade,
+            evidence,
+            started=started,
+        )
+    except Exception:
+        report = _unverified(
+            migration_id,
+            started,
+            checksum=artifact.checksum,
+            fingerprint=artifact.schema_fingerprint,
+            error="Sandbox downgrade verification failed unexpectedly.",
+        )
+    snapshot_recovery = _safe_restore(settings, checkpoint)
+    original_restore = _safe_restore(settings, preexisting)
+    return report.model_copy(
+        update={
+            "snapshot_recovery": snapshot_recovery,
+            "preexisting_sandbox_recovery": original_restore,
+        }
     )
+
+
+def _safe_restore(settings: Settings, checkpoint: SnapshotRecoveryReport) -> SnapshotRecoveryReport:
+    try:
+        return restore_verified_checkpoint(
+            settings,
+            checkpoint,
+            _lifecycle_lock_held=True,
+        )
+    except Exception:
+        return checkpoint.model_copy(
+            update={
+                "restore_status": "verification_incomplete",
+                "error": "Sandbox snapshot restore could not be completed or verified.",
+            }
+        )
 
 
 def downgrade_verified_upgrade(
@@ -211,7 +361,7 @@ def downgrade_verified_upgrade(
     data_loss = any(item.data_loss_on_downgrade for item in artifact.operation_reversibility)
     limitations = [_VALUE_LOSS] if data_loss else []
     try:
-        observed, checks, failed, schema_matches, data_restored = _downgrade(
+        observed, checks, failed, schema_matches, data_restored, downgrade_executed = _downgrade(
             settings,
             artifact,
             statements,
@@ -242,7 +392,7 @@ def downgrade_verified_upgrade(
     status = classify_restoration(
         upgrade_passed=True,
         evidence_complete=True,
-        downgrade_executed=True,
+        downgrade_executed=downgrade_executed,
         downgrade_failed=failed,
         schema_matches=schema_matches,
         data_restored=data_restored,
@@ -259,12 +409,21 @@ def downgrade_verified_upgrade(
             None,
         )
         error = command_error or "Downgrade did not restore the recorded baseline."
+    elif not downgrade_executed:
+        error = next(
+            (
+                check.detail
+                for check in checks
+                if check.name == "rollback_precondition" and check.status == "failed"
+            ),
+            "Downgrade was not run because its sandbox preconditions failed.",
+        )
     return _from_upgrade(
         upgrade,
         evidence,
         started_at,
         status=status,
-        downgrade_executed=True,
+        downgrade_executed=downgrade_executed,
         schema_matches=schema_matches,
         observed=observed,
         checks=checks,
@@ -325,7 +484,7 @@ def read_baseline_evidence(settings: Settings, snapshot: SchemaSnapshot) -> Base
 
 def live_schema_matches(settings: Settings, fingerprint: str) -> bool:
     with _connect(settings) as connection:
-        observed = assemble_snapshot(load_catalog(connection)).fingerprint
+        observed = _sandbox_snapshot(connection, SANDBOX_SOURCE_ID).fingerprint
     return observed == fingerprint
 
 
@@ -335,14 +494,62 @@ def _downgrade(
     statements: list[DowngradeStatement],
     evidence: BaselineEvidence,
     data_loss: bool,
-) -> tuple[str, list[SandboxCheck], bool, bool, bool]:
+) -> tuple[str, list[SandboxCheck], bool, bool, bool, bool]:
     checks: list[SandboxCheck] = []
     upgrade_statements = parse_upgrade_sql(artifact.sql_preview)
     with _connect(settings) as connection:
-        if data_loss:
-            with connection.begin():
-                _write_sentinels(connection, upgrade_statements)
         failed = False
+        if data_loss:
+            try:
+                with connection.begin():
+                    _write_sentinels(connection, upgrade_statements)
+            except Exception as exc:
+                checks.append(
+                    SandboxCheck(
+                        name="rollback_precondition",
+                        status="failed",
+                        detail=_public_error(exc),
+                    )
+                )
+                observed = _sandbox_snapshot(connection, artifact.source_id)
+                current = _evidence(connection, observed.fingerprint)
+                schema_matches = current.schema_fingerprint == evidence.schema_fingerprint
+                data_restored = (
+                    current.row_counts == evidence.row_counts and current.emails == evidence.emails
+                )
+                checks.extend(
+                    [
+                        SandboxCheck(
+                            name="schema_fingerprint",
+                            status="passed" if schema_matches else "failed",
+                            detail=(
+                                "Compared the post-downgrade fingerprint "
+                                "with the recorded baseline."
+                            ),
+                        ),
+                        SandboxCheck(
+                            name="baseline_rows",
+                            status="passed" if data_restored else "failed",
+                            detail="Compared recorded row counts and user emails.",
+                        ),
+                        SandboxCheck(
+                            name="former_column_values",
+                            status="not_run",
+                            detail=(
+                                "The rollback precondition failed before sentinel "
+                                "values were written."
+                            ),
+                        ),
+                    ]
+                )
+                return (
+                    current.schema_fingerprint,
+                    checks,
+                    True,
+                    schema_matches,
+                    data_restored,
+                    False,
+                )
         try:
             with connection.begin():
                 for statement in statements:
@@ -361,7 +568,7 @@ def _downgrade(
                     detail="Downgrade statements finished.",
                 )
             )
-        observed = assemble_snapshot(load_catalog(connection))
+        observed = _sandbox_snapshot(connection, artifact.source_id)
         current = _evidence(connection, observed.fingerprint)
     schema_matches = current.schema_fingerprint == evidence.schema_fingerprint
     data_restored = current.row_counts == evidence.row_counts and current.emails == evidence.emails
@@ -387,7 +594,20 @@ def _downgrade(
                 detail=_VALUE_LOSS,
             )
         )
-    return current.schema_fingerprint, checks, failed, schema_matches, data_restored
+    return current.schema_fingerprint, checks, failed, schema_matches, data_restored, True
+
+
+def _sandbox_snapshot(connection: Connection, source_id: str) -> SchemaSnapshot:
+    """Fingerprint catalog state using the artifact's source identity."""
+
+    database_name = (
+        SANDBOX_DATABASE_NAME if source_id == SANDBOX_SOURCE_ID else DEMO_DATABASE_NAME
+    )
+    return assemble_snapshot(
+        load_catalog(connection),
+        source_id=source_id,
+        database_name=database_name,
+    )
 
 
 def _write_sentinels(connection: Connection, statements: list) -> None:
@@ -458,6 +678,7 @@ def _connect(settings: Settings):
 
     try:
         _assert_identity(connection)
+        connection.commit()
     except Exception:
         connection.close()
         engine.dispose()
@@ -466,6 +687,16 @@ def _connect(settings: Settings):
 
 
 def _parse_downgrade_line(line: str) -> DowngradeStatement | None:
+    match = _ADD_COLUMN.fullmatch(line)
+    if match is not None:
+        return DowngradeStatement(
+            "add_column",
+            line,
+            match.group("schema"),
+            match.group("table"),
+            match.group("column"),
+            match.group("data_type"),
+        )
     match = _DROP_COLUMN.fullmatch(line)
     if match is not None:
         return DowngradeStatement(
@@ -507,6 +738,8 @@ def _parse_downgrade_line(line: str) -> DowngradeStatement | None:
 
 
 def _downgrade_mentions(body: str, statement: DowngradeStatement) -> bool:
+    if statement.kind == "add_column":
+        return "op.add_column(" in body and f'"{statement.name}"' in body
     if statement.kind == "drop_column":
         return "op.drop_column(" in body and f'"{statement.name}"' in body
     if statement.kind == "drop_index":
@@ -526,6 +759,8 @@ def _unverified(
     *,
     checksum: str = "",
     fingerprint: str = "",
+    snapshot_recovery: SnapshotRecoveryReport | None = None,
+    preexisting_sandbox_recovery: SnapshotRecoveryReport | None = None,
     error: str,
 ) -> RollbackReport:
     return RollbackReport(
@@ -543,6 +778,8 @@ def _unverified(
         data_checks=[],
         data_loss_limitations=[],
         error=error,
+        snapshot_recovery=snapshot_recovery,
+        preexisting_sandbox_recovery=preexisting_sandbox_recovery,
     )
 
 
@@ -557,6 +794,7 @@ def _from_upgrade(
     observed: str | None = None,
     checks: list[SandboxCheck] | None = None,
     limitations: list[str] | None = None,
+    snapshot_recovery: SnapshotRecoveryReport | None = None,
     error: str | None,
 ) -> RollbackReport:
     return RollbackReport(
@@ -578,6 +816,7 @@ def _from_upgrade(
         data_checks=checks or [],
         data_loss_limitations=limitations or [],
         error=error,
+        snapshot_recovery=snapshot_recovery,
     )
 
 

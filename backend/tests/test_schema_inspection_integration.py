@@ -15,11 +15,27 @@ def test_live_bookstore_snapshot_lists_tables_and_relationships(seeded_demo: Set
     second = inspect_source(seeded_demo, "bookstore-demo")
 
     assert [table.name for table in first.tables] == [
+        "addresses",
+        "categories",
+        "inventory_movements",
         "order_items",
         "orders",
+        "payments",
         "products",
+        "reviews",
         "users",
     ]
+    assert len(first.dependencies) == 12
+    categories = next(table for table in first.tables if table.name == "categories")
+    assert any(
+        item.name == "categories_parent_fk" and item.referenced_table == "categories"
+        for item in categories.constraints
+    )
+    products = next(table for table in first.tables if table.name == "products")
+    assert any(
+        item.name == "products_category_fk" and item.referenced_table == "categories"
+        for item in products.constraints
+    )
     orders = next(table for table in first.tables if table.name == "orders")
     user_fk = next(item for item in orders.constraints if item.name == "orders_user_fk")
     assert user_fk.kind == "foreign_key"

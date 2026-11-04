@@ -29,6 +29,8 @@ class MigrationWorkflow(Base):
     schema_fingerprint: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     migration_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     artifact_checksum: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    owner_identity: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
+    visibility: Mapped[str] = mapped_column(String(16), nullable=False, default="shared")
     artifact_status: Mapped[str] = mapped_column(String(32), nullable=False, default="generated")
     artifact_applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     state: Mapped[str] = mapped_column(String(48), nullable=False, index=True)

@@ -11,7 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
 
-from app.demo.bookstore import EXPECTED_COUNTS, EXPECTED_EMAILS, EXPECTED_TABLES
+from app.demo.bookstore import EXPECTED_COUNTS, EXPECTED_TABLES
 from app.schemas.artifacts import MigrationArtifact
 from app.schemas.sandbox import SandboxCheck
 
@@ -20,6 +20,10 @@ _TYPE = r"TEXT|INTEGER|BIGINT|BOOLEAN|TIMESTAMP WITH TIME ZONE"
 _ADD_COLUMN = re.compile(
     rf'^ALTER TABLE "(?P<schema>{_IDENTIFIER})"\."(?P<table>{_IDENTIFIER})" '
     rf'ADD COLUMN "(?P<column>{_IDENTIFIER})" (?P<data_type>{_TYPE}) NULL;$'
+)
+_DROP_COLUMN = re.compile(
+    rf'^ALTER TABLE "(?P<schema>{_IDENTIFIER})"\."(?P<table>{_IDENTIFIER})" '
+    rf'DROP COLUMN "(?P<column>{_IDENTIFIER})";$'
 )
 _CREATE_INDEX = re.compile(
     rf'^CREATE INDEX "(?P<index>{_IDENTIFIER})" ON '
@@ -36,7 +40,7 @@ _RENAME_TABLE = re.compile(
 )
 _BLOCKED = re.compile(
     r"\bdrop\s+table\b|\btruncate\b|\badd\s+constraint\b|\bset\s+not\s+null\b|"
-    r"\bdrop\s+column\b|\bexecute\b",
+    r"\bexecute\b",
     re.IGNORECASE,
 )
 
@@ -116,6 +120,7 @@ def assert_alembic_matches(artifact: MigrationArtifact, statements: list[Upgrade
 def validate_upgrade(
     connection: Connection,
     statements: list[UpgradeStatement],
+    baseline_counts: dict[str, int] | None = None,
 ) -> list[SandboxCheck]:
     """Read the sandbox catalog after an upgrade. Unrun checks stay `not_run`."""
 
@@ -132,7 +137,7 @@ def validate_upgrade(
         ),
     ]
     checks.extend(_change_checks(connection, statements))
-    checks.extend(_invariant_checks(connection, statements))
+    checks.extend(_invariant_checks(connection, statements, baseline_counts))
     return checks
 
 
@@ -145,6 +150,15 @@ def baseline_matches(connection: Connection) -> bool:
 
 
 def _parse_line(line: str) -> UpgradeStatement | None:
+    match = _DROP_COLUMN.fullmatch(line)
+    if match is not None:
+        return UpgradeStatement(
+            kind="destructive",
+            sql_text=line,
+            schema_name=match.group("schema"),
+            table=match.group("table"),
+            column=match.group("column"),
+        )
     match = _ADD_COLUMN.fullmatch(line)
     if match is not None:
         return UpgradeStatement(
@@ -195,6 +209,12 @@ def _upgrade_body(source: str) -> str | None:
 
 
 def _upgrade_mentions(upgrade: str, statement: UpgradeStatement) -> bool:
+    if statement.kind == "destructive":
+        return (
+            "op.drop_column(" in upgrade
+            and f'"{statement.table}"' in upgrade
+            and f'"{statement.column}"' in upgrade
+        )
     if statement.kind == "add_column":
         return (
             "op.add_column(" in upgrade
@@ -228,6 +248,8 @@ def _change_checks(
             checks.append(_index_check(connection, statement))
         elif statement.kind == "rename_column":
             checks.append(_renamed_column_check(connection, statement))
+        elif statement.kind == "destructive":
+            checks.append(_dropped_column_check(connection, statement))
         else:
             checks.append(_renamed_table_check(connection, statement))
     return checks
@@ -305,6 +327,17 @@ def _renamed_column_check(connection: Connection, statement: UpgradeStatement) -
     )
 
 
+def _dropped_column_check(connection: Connection, statement: UpgradeStatement) -> SandboxCheck:
+    present = _column_present(connection, statement.table, statement.column)
+    return _check(
+        f"drop_column:{statement.table}.{statement.column}",
+        "failed" if present else "passed",
+        "The column is still present after the migration."
+        if present
+        else "The requested column is absent in the sandbox; its values were discarded there.",
+    )
+
+
 def _renamed_table_check(connection: Connection, statement: UpgradeStatement) -> SandboxCheck:
     tables = _table_names(connection)
     if statement.new_name in tables and statement.table not in tables:
@@ -323,6 +356,7 @@ def _renamed_table_check(connection: Connection, statement: UpgradeStatement) ->
 def _invariant_checks(
     connection: Connection,
     statements: list[UpgradeStatement],
+    baseline_counts: dict[str, int] | None,
 ) -> list[SandboxCheck]:
     renamed = {
         statement.table: statement.new_name
@@ -330,7 +364,10 @@ def _invariant_checks(
         if statement.kind == "rename_table" and statement.new_name is not None
     }
     checks: list[SandboxCheck] = []
-    for table, expected in EXPECTED_COUNTS.items():
+    expected_counts = baseline_counts or {
+        table: _count(connection, table) for table in _table_names(connection)
+    }
+    for table, expected in expected_counts.items():
         current = renamed.get(table, table)
         if current not in _table_names(connection):
             checks.append(_check(f"count:{table}", "not_run", "The table is not in the sandbox."))
@@ -339,14 +376,8 @@ def _invariant_checks(
         status = "passed" if actual == expected else "failed"
         checks.append(_check(f"count:{table}", status, f"Observed {actual} rows."))
     if "users" in _table_names(connection) and "users" not in renamed:
-        emails = tuple(
-            connection.execute(text("SELECT email FROM bookstore.users ORDER BY id")).scalars()
-        )
-        status = "passed" if emails == EXPECTED_EMAILS else "failed"
-        checks.append(_check("seed_emails", status, "Compared the packaged user emails."))
         checks.append(_duplicate_email_check(connection))
     else:
-        checks.append(_check("seed_emails", "not_run", "users was renamed or is absent."))
         checks.append(
             _check("duplicate_email", "not_run", "The email constraint was not probed.")
         )

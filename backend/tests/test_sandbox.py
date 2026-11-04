@@ -1,7 +1,9 @@
 """Sandbox unit tests. These tests do not open PostgreSQL and do not prove a live upgrade."""
 
 import hashlib
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from app.core.config import (
@@ -14,6 +16,8 @@ from app.db import session as session_module
 from app.main import create_app
 from app.schemas.artifacts import MigrationArtifact, OperationReversibility
 from app.schemas.domain import ColumnSnapshot, SchemaSnapshot, TableSnapshot
+from app.schemas.rollback import SnapshotRecoveryReport
+from app.schemas.sandbox import SandboxRun, SandboxRunRequest
 from app.services.migration_generator import canonical_artifact_json, generate_migration
 from app.services.planner import propose_migration
 from app.services.risk_engine import assess_risk
@@ -195,6 +199,7 @@ def test_connection_identity_is_required_before_changes() -> None:
         "Add an index on the user_id column of orders",
         "Rename the status column on orders to order_status",
         "Rename table users to customers",
+        "Drop the status column from orders",
     ],
 )
 def test_generated_operations_stay_eligible(request_text: str, tmp_path: Path) -> None:
@@ -322,12 +327,189 @@ def test_sandbox_route_rejects_bad_requests_without_connecting(
     assert "secret" not in extra.text
 
 
-def test_sandbox_route_hides_unavailable_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sandbox_route_checkpoints_before_running_the_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api import sandbox as sandbox_api
+
+    artifact = _artifact(
+        _snapshot(),
+        "Add a nullable text column called nickname to users",
+        tmp_path,
+    )
+    events: list[str] = []
+    checkpoint = SnapshotRecoveryReport(
+        checkpoint_id="a" * 32,
+        backup_status="verified",
+        restore_status="not_attempted",
+        baseline_schema_fingerprint="original-schema",
+        restored_schema_fingerprint="original-schema",
+        baseline_data_fingerprint="original-data",
+        restored_data_fingerprint="original-data",
+        schema_match=True,
+        data_match=True,
+        checkpoint_retained=True,
+    )
+
+    @contextmanager
+    def fake_lifecycle_lock(_settings):
+        yield
+
+    def save_session(session) -> None:
+        events.append("save-session")
+        assert session.state == "ready"
+        assert session.checkpoint.checkpoint_id == checkpoint.checkpoint_id
+
+    def fake_run(*_args, **_kwargs):
+        events.append("run-migration")
+        return SandboxRun(
+            migration_id=artifact.migration_id,
+            source_id=artifact.source_id,
+            schema_fingerprint=artifact.schema_fingerprint,
+            artifact_checksum=artifact.checksum,
+            sandbox_database="schemapilot_sandbox",
+            sandbox_user="schemapilot_sandbox",
+            postgres_version="16.0",
+            started_at="2026-11-01T00:00:00+00:00",
+            finished_at="2026-11-01T00:00:01+00:00",
+            result="passed",
+            upgrade_applied=True,
+            restored=False,
+            cleaned_up=False,
+            checks=[],
+            observed_tables=["users"],
+        )
+
+    monkeypatch.setattr(sandbox_api, "ARTIFACTS_DIR", tmp_path)
+    monkeypatch.setattr(sandbox_api, "load_verified_artifact", lambda *_args: artifact)
+    monkeypatch.setattr(sandbox_api, "sandbox_lifecycle_lock", fake_lifecycle_lock)
+    monkeypatch.setattr(sandbox_api, "assert_no_active_checkpoint_session", lambda: None)
+    monkeypatch.setattr(sandbox_api, "inspect_sandbox", lambda *_args: _snapshot())
+    monkeypatch.setattr(sandbox_api, "read_baseline_evidence", lambda *_args: None)
+
+    def create_checkpoint(*_args, **_kwargs):
+        events.append("capture-checkpoint")
+        return checkpoint
+
+    monkeypatch.setattr(sandbox_api, "create_verified_checkpoint", create_checkpoint)
+    monkeypatch.setattr(sandbox_api, "save_checkpoint_session", save_session)
+    monkeypatch.setattr(sandbox_api, "save_validation_evidence", lambda *_args: None)
+    monkeypatch.setattr(sandbox_api, "run_sandbox", fake_run)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(settings=_settings())))
+
+    result = sandbox_api.run_artifact_in_sandbox(
+        "bookstore-demo",
+        artifact.migration_id,
+        SandboxRunRequest(confirm=True),
+        request,
+    )
+    assert events == ["capture-checkpoint", "save-session", "run-migration"]
+    assert result.pre_migration_snapshot_verified is True
+    assert result.snapshot_session_id is not None
+
+
+def test_checkpoint_session_status_discovers_only_matching_active_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.api import sandbox as sandbox_api
+    from app.services import sandbox_checkpoint_store as checkpoint_store
+
+    artifact = _artifact(
+        _snapshot(),
+        "Add a nullable text column called nickname to users",
+        tmp_path,
+    )
+    checkpoint = SnapshotRecoveryReport(
+        checkpoint_id="a" * 32,
+        backup_status="verified",
+        restore_status="not_attempted",
+        baseline_schema_fingerprint="original-schema",
+        restored_schema_fingerprint="original-schema",
+        baseline_data_fingerprint="original-data",
+        restored_data_fingerprint="original-data",
+        schema_match=True,
+        data_match=True,
+        checkpoint_retained=True,
+    )
+    session = checkpoint_store.SandboxCheckpointSession(
+        session_id="b" * 32,
+        migration_id=artifact.migration_id,
+        artifact_checksum=artifact.checksum,
+        state="recovery_required",
+        checkpoint=checkpoint,
+        error="Restore verification is incomplete.",
+    )
+    sessions_dir = tmp_path / "sessions"
+    checkpoint_store.save_checkpoint_session(session, directory=sessions_dir)
+    monkeypatch.setattr(sandbox_api, "ARTIFACTS_DIR", tmp_path)
+    monkeypatch.setattr(checkpoint_store, "CHECKPOINT_SESSION_DIR", sessions_dir)
+
+    status = sandbox_api.get_sandbox_checkpoint_session("bookstore-demo")
+
+    assert status.active is True
+    assert status.snapshot_session_id == session.session_id
+    assert status.state == "recovery_required"
+    assert status.checkpoint_verified is True
+    assert status.restore_status == "not_attempted"
+    assert "checkpoint_id" not in status.model_dump()
+
+
+def test_sandbox_route_hides_unavailable_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from contextlib import contextmanager
+
+    from app.api import sandbox as sandbox_api
+
+    artifact = _artifact(
+        _snapshot(),
+        "Add a nullable text column called nickname to users",
+        tmp_path,
+    )
+
     def unavailable(*_args: object, **_kwargs: object) -> None:
         raise SandboxUnavailable
 
-    monkeypatch.setattr("app.api.sandbox.run_sandbox", unavailable)
-    client = TestClient(create_app(_settings(allow_sandbox_execution=True)))
+    @contextmanager
+    def fake_lock(_settings):
+        yield
+
+    checkpoint = SnapshotRecoveryReport(
+        checkpoint_id="a" * 32,
+        backup_status="verified",
+        restore_status="not_attempted",
+        baseline_schema_fingerprint="original",
+        baseline_data_fingerprint="original-data",
+    )
+    monkeypatch.setattr(sandbox_api, "ARTIFACTS_DIR", tmp_path)
+    monkeypatch.setattr(sandbox_api, "load_verified_artifact", lambda *_args: artifact)
+    monkeypatch.setattr(sandbox_api, "sandbox_lifecycle_lock", fake_lock)
+    monkeypatch.setattr(sandbox_api, "assert_no_active_checkpoint_session", lambda: None)
+    monkeypatch.setattr(sandbox_api, "inspect_sandbox", lambda *_args: _snapshot())
+    monkeypatch.setattr(sandbox_api, "read_baseline_evidence", lambda *_args: None)
+    monkeypatch.setattr(
+        sandbox_api,
+        "create_verified_checkpoint",
+        lambda *_args, **_kwargs: checkpoint,
+    )
+    monkeypatch.setattr(sandbox_api, "save_checkpoint_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        sandbox_api,
+        "transition_checkpoint_session",
+        lambda session, **kwargs: session.model_copy(update=kwargs),
+    )
+    monkeypatch.setattr(
+        sandbox_api,
+        "restore_verified_checkpoint",
+        lambda *_args, **_kwargs: checkpoint,
+    )
+    monkeypatch.setattr(sandbox_api, "run_sandbox", unavailable)
+    client = TestClient(
+        create_app(_settings(allow_sandbox_execution=True, sandbox_database_url=SANDBOX_URL))
+    )
     response = client.post(
         "/api/v1/sources/bookstore-demo/artifacts/sp0123456789ab/sandbox",
         json={"confirm": True},

@@ -71,8 +71,6 @@ def test_sandbox_upgrade_adds_a_nullable_column(sandbox_settings: Settings, tmp_
         tmp_path,
     )
     result = run_sandbox(sandbox_settings, artifact.migration_id, directory=tmp_path)
-    print("SANDBOX ERROR:", result.error)
-    print("SANDBOX CHECKS:", [check.model_dump() for check in result.checks])
     assert result.result == "passed"
     assert result.upgrade_applied is True
     assert result.restored is False
@@ -90,6 +88,25 @@ def test_sandbox_upgrade_adds_a_nullable_column(sandbox_settings: Settings, tmp_
     assert _check(result.checks, "duplicate_email").status == "passed"
     assert "://" not in result.model_dump_json()
     assert _version_names() == before
+
+
+def test_sandbox_runs_destructive_column_drop_as_sandbox_only(
+    sandbox_settings: Settings,
+    tmp_path: Path,
+) -> None:
+    snapshot = prepare_sandbox_baseline(sandbox_settings)
+    proposal = propose_migration(snapshot, "Drop the status column from orders")
+    artifact = generate_migration(snapshot, proposal, assess_risk(snapshot, proposal), tmp_path)
+    assert artifact.sandbox_only is True
+    assert artifact.applied is False
+
+    result = run_sandbox(sandbox_settings, artifact.migration_id, directory=tmp_path)
+
+    assert result.result == "passed"
+    assert result.upgrade_applied is True
+    assert _check(result.checks, "drop_column:orders.status").status == "passed"
+    assert _check(result.checks, "count:orders").status == "passed"
+    assert result.sandbox_database == "schemapilot_sandbox"
 
 
 def test_failed_migration_records_the_verified_baseline(
@@ -203,7 +220,7 @@ def _rename_conflict(fingerprint: str, directory: Path) -> MigrationArtifact:
     )
     artifact = MigrationArtifact(
         migration_id="sp0123456789ab",
-        source_id="bookstore-demo",
+        source_id="sandbox",
         schema_name="bookstore",
         schema_fingerprint=fingerprint,
         summary="Rename users to orders.",

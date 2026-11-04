@@ -3,7 +3,7 @@
 from pathlib import Path
 
 SQL_DIRECTORY = Path(__file__).with_name("sql")
-ALLOWED_SQL_FILES = frozenset({"schema.sql", "seed.sql"})
+ALLOWED_SQL_FILES = frozenset({"schema.sql", "seed.sql", "showcase_upgrade.sql"})
 
 
 def read_sql_file(name: str) -> str:

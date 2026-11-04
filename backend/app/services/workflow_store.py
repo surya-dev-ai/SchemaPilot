@@ -13,7 +13,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
@@ -37,6 +37,8 @@ from app.schemas.workflow import (
 from app.services.auth import (
     AuthenticatedPrincipal,
     AuthenticationError,
+    can_access_team_workspace,
+    has_configured_role,
     require_authenticated_principal,
 )
 
@@ -135,9 +137,26 @@ def persist_workflow(
     assessment: RiskAssessment,
     report: SafetyReport,
     rollback: RollbackReport | None,
+    principal: AuthenticatedPrincipal | None = None,
+    visibility: str = "shared",
     engine: Engine | None = None,
 ) -> WorkflowDetail:
-    """Store one safety-report bundle. Duplicate artifact bindings are rejected."""
+    """Store one safety-report bundle, with a guarded local evidence refresh."""
+
+    if visibility not in {"shared", "private"}:
+        raise WorkflowStoreError("invalid_visibility", "Workflow visibility is invalid.")
+    if settings.authentication_available and principal is None:
+        raise WorkflowStoreError("authentication_required", "Sign in to save workflows.")
+    if (
+        settings.authentication_available
+        and visibility == "shared"
+        and not can_access_team_workspace(settings, principal)
+    ):
+        raise WorkflowStoreError(
+            "team_workspace_access_denied", "Team workspace access is required."
+        )
+    if visibility == "private" and principal is None:
+        raise WorkflowStoreError("authentication_required", "Private workflows require sign-in.")
 
     checksum = report_checksum(report)
     fingerprint = evidence_fingerprint(
@@ -158,6 +177,8 @@ def persist_workflow(
         schema_fingerprint=report.schema_fingerprint,
         migration_id=report.migration_id,
         artifact_checksum=report.artifact_checksum,
+        owner_identity=principal.identity if principal else None,
+        visibility=visibility,
         artifact_status=report.artifact_status,
         artifact_applied=False,
         state=state,
@@ -177,6 +198,83 @@ def persist_workflow(
     )
     try:
         with metadata_session(settings, engine) as session:
+            existing = session.scalar(
+                select(MigrationWorkflow).where(
+                    MigrationWorkflow.migration_id == report.migration_id,
+                    MigrationWorkflow.artifact_checksum == report.artifact_checksum,
+                )
+            )
+            if existing is not None:
+                # A first report may have been saved before a corrected safety
+                # policy made the same sandbox-only artifact reviewable. Allow
+                # only that one-way refresh in unauthenticated local mode; keep
+                # the workflow identity and audit trail, and never revise an
+                # approved or applied workflow.
+                approvals = session.scalar(
+                    select(ApprovalRecord.id)
+                    .where(ApprovalRecord.workflow_id == existing.id)
+                    .limit(1)
+                )
+                can_refresh = (
+                    not settings.authentication_available
+                    and existing.state == "blocked"
+                    and not existing.eligible_for_review
+                    and not existing.report_stale
+                    and not existing.artifact_applied
+                    and not report.applied
+                    and report.eligible_for_review
+                    and approvals is None
+                    and existing.report_checksum != checksum
+                )
+                if not can_refresh:
+                    raise WorkflowStoreError(
+                        "duplicate_workflow_artifact",
+                        "A workflow already exists for this migration id and artifact checksum.",
+                    )
+
+                previous_report_checksum = existing.report_checksum
+                existing.source_id = report.source_id
+                existing.request_text = report.request
+                existing.intent_summary = report.interpreted_intent
+                existing.schema_fingerprint = report.schema_fingerprint
+                existing.artifact_status = report.artifact_status
+                existing.state = state
+                existing.plan_json = proposal.model_dump_json()
+                existing.risk_json = assessment.model_dump_json()
+                existing.sandbox_json = (
+                    None if report.sandbox is None else report.sandbox.model_dump_json()
+                )
+                existing.rollback_json = (
+                    None if rollback is None else rollback.model_dump_json()
+                )
+                existing.report_json = report.model_dump_json()
+                existing.report_checksum = checksum
+                existing.evidence_fingerprint = fingerprint
+                existing.eligible_for_review = report.eligible_for_review
+                existing.fully_reversible = report.fully_reversible
+                existing.rollback_status = report.rollback_status
+                existing.report_stale = False
+                existing.updated_at = now
+                session.add(
+                    _audit(
+                        existing.id,
+                        "workflow_evidence_refreshed",
+                        {
+                            "migration_id": report.migration_id,
+                            "artifact_checksum": report.artifact_checksum,
+                            "previous_report_checksum": previous_report_checksum,
+                            "report_checksum": checksum,
+                            "eligible_for_review": report.eligible_for_review,
+                            "state": state,
+                            "interpretation_path": proposal.interpretation_path,
+                            "provider_status": proposal.provider_status,
+                            "schema_fingerprint": report.schema_fingerprint,
+                        },
+                    )
+                )
+                session.flush()
+                return _detail(session, existing)
+
             session.add(row)
             session.add(
                 _audit(
@@ -205,12 +303,28 @@ def persist_workflow(
         raise WorkflowStoreUnavailable from exc
 
 
-def list_workflows(settings: Settings, engine: Engine | None = None) -> WorkflowListResponse:
+def list_workflows(
+    settings: Settings,
+    engine: Engine | None = None,
+    *,
+    principal: AuthenticatedPrincipal | None = None,
+) -> WorkflowListResponse:
     try:
         with metadata_session(settings, engine) as session:
-            rows = session.scalars(
-                select(MigrationWorkflow).order_by(MigrationWorkflow.created_at.desc())
-            ).all()
+            query = select(MigrationWorkflow)
+            if settings.authentication_available:
+                if principal is None:
+                    raise WorkflowStoreError("unauthenticated", "Sign in to view workflow history.")
+                owned_private = (MigrationWorkflow.owner_identity == principal.identity) & (
+                    MigrationWorkflow.visibility == "private"
+                )
+                if can_access_team_workspace(settings, principal):
+                    query = query.where(
+                        or_(MigrationWorkflow.visibility == "shared", owned_private)
+                    )
+                else:
+                    query = query.where(owned_private)
+            rows = session.scalars(query.order_by(MigrationWorkflow.created_at.desc())).all()
             return WorkflowListResponse(workflows=[_summary(row) for row in rows])
     except OperationalError as exc:
         raise WorkflowStoreUnavailable from exc
@@ -221,6 +335,7 @@ def get_workflow(
     workflow_id: str,
     *,
     current_fingerprint: str | None = None,
+    principal: AuthenticatedPrincipal | None = None,
     engine: Engine | None = None,
 ) -> WorkflowDetail:
     try:
@@ -228,6 +343,7 @@ def get_workflow(
             row = session.get(MigrationWorkflow, workflow_id)
             if row is None:
                 raise WorkflowStoreError("workflow_not_found", "The workflow was not found.")
+            _require_workflow_access(settings, row, principal)
             if current_fingerprint is not None and current_fingerprint != row.evidence_fingerprint:
                 row.report_stale = True
                 row.eligible_for_review = False
@@ -273,6 +389,8 @@ def record_approval(
         authenticated = require_authenticated_principal(settings, principal)
     except AuthenticationError as exc:
         raise WorkflowStoreError(exc.code, exc.message) from exc
+    if not has_configured_role(settings, authenticated, "approver"):
+        raise WorkflowStoreError("permission_denied", "The approver role is required.")
     target = body.target_identity
     if target.lower() in _RESERVED_TARGETS:
         raise WorkflowStoreError(
@@ -289,28 +407,32 @@ def record_approval(
                     "workflow_not_found",
                     "The workflow was not found.",
                 )
+            elif not _can_access_workflow(settings, row, authenticated):
+                pending_error = WorkflowStoreError(
+                    "workflow_not_found", "The workflow was not found."
+                )
             elif (
-                current_fingerprint is not None
-                and current_fingerprint != row.evidence_fingerprint
+                current_fingerprint is not None and current_fingerprint != row.evidence_fingerprint
             ):
                 row.report_stale = True
                 row.eligible_for_review = False
                 row.state = "blocked"
                 row.updated_at = _now()
-                session.add(
-                    _audit(row.id, "approval_rejected_stale", {"target_identity": target})
-                )
+                session.add(_audit(row.id, "approval_rejected_stale", {"target_identity": target}))
                 pending_error = WorkflowStoreError(
                     "stale_safety_report",
                     "The safety report is stale relative to the current evidence.",
                 )
             elif row.report_stale:
-                session.add(
-                    _audit(row.id, "approval_rejected_stale", {"target_identity": target})
-                )
+                session.add(_audit(row.id, "approval_rejected_stale", {"target_identity": target}))
                 pending_error = WorkflowStoreError(
                     "stale_safety_report",
                     "The safety report is marked stale and cannot be approved.",
+                )
+            elif row.owner_identity == authenticated.identity:
+                pending_error = WorkflowStoreError(
+                    "self_approval_forbidden",
+                    "A workflow owner cannot approve their own workflow.",
                 )
             elif expected_artifact_checksum and expected_artifact_checksum != row.artifact_checksum:
                 session.add(
@@ -371,6 +493,33 @@ def record_approval(
                     pending_error = WorkflowStoreError(
                         "rollback_not_verified",
                         "Approval requires exact_restoration or partial_restoration.",
+                    )
+                elif (
+                    report.snapshot_recovery is None
+                    or report.snapshot_recovery.backup_status != "verified"
+                    or report.snapshot_recovery.restore_status != "restore_verified"
+                ):
+                    session.add(
+                        _audit(
+                            row.id,
+                            "approval_rejected_snapshot_recovery",
+                            {
+                                "backup_status": (
+                                    report.snapshot_recovery.backup_status
+                                    if report.snapshot_recovery
+                                    else "missing"
+                                ),
+                                "restore_status": (
+                                    report.snapshot_recovery.restore_status
+                                    if report.snapshot_recovery
+                                    else "missing"
+                                ),
+                            },
+                        )
+                    )
+                    pending_error = WorkflowStoreError(
+                        "snapshot_recovery_not_verified",
+                        "Approval requires a verified sandbox checkpoint restoration.",
                     )
                 else:
                     approval = ApprovalRecord(
@@ -444,6 +593,7 @@ def _detail(session: Session, row: MigrationWorkflow) -> WorkflowDetail:
         artifact_status=row.artifact_status,
         artifact_applied=False,
         schema_fingerprint=row.schema_fingerprint,
+        visibility=row.visibility,  # type: ignore[arg-type]
         state=row.state,  # type: ignore[arg-type]
         report_checksum=row.report_checksum,
         evidence_fingerprint=row.evidence_fingerprint,
@@ -466,6 +616,7 @@ def _summary(row: MigrationWorkflow) -> WorkflowSummary:
         migration_id=row.migration_id,
         artifact_checksum=row.artifact_checksum,
         schema_fingerprint=row.schema_fingerprint,
+        visibility=row.visibility,  # type: ignore[arg-type]
         state=row.state,  # type: ignore[arg-type]
         eligible_for_review=row.eligible_for_review and not row.report_stale,
         report_stale=row.report_stale,
@@ -487,6 +638,29 @@ def _approval_summary(row: ApprovalRecord) -> ApprovalSummary:
         approver_identity=row.approver_identity,
         limitation=row.limitation,
         created_at=_iso(row.created_at),
+    )
+
+
+def _require_workflow_access(
+    settings: Settings,
+    row: MigrationWorkflow,
+    principal: AuthenticatedPrincipal | None,
+) -> None:
+    if not _can_access_workflow(settings, row, principal):
+        raise WorkflowStoreError("workflow_not_found", "The workflow was not found.")
+
+
+def _can_access_workflow(
+    settings: Settings,
+    row: MigrationWorkflow,
+    principal: AuthenticatedPrincipal | None,
+) -> bool:
+    if not settings.authentication_available:
+        return True
+    if principal is None:
+        return False
+    return (row.visibility == "shared" and can_access_team_workspace(settings, principal)) or (
+        row.visibility == "private" and row.owner_identity == principal.identity
     )
 
 

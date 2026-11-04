@@ -241,6 +241,25 @@ def test_destructive_request_is_marked_and_not_sql() -> None:
     assert "ALTER " not in serialized
 
 
+def test_punctuated_column_drop_resolves_only_one_existing_column() -> None:
+    snapshot = _snapshot()
+    proposal = propose_migration(
+        snapshot,
+        "Drop the column, order, status from orders.",
+    )
+    assert proposal.status == "proposed"
+    assert proposal.operations[0].kind == "destructive"
+    assert proposal.operations[0].table == "orders"
+    assert proposal.operations[0].column == "status"
+
+    orders = next(table for table in snapshot.tables if table.name == "orders")
+    orders.columns.append(_column("orders", "order_status", position=99))
+    ambiguous = propose_migration(snapshot, "Drop the column order status from orders")
+    assert ambiguous.status == "needs_clarification"
+    assert ambiguous.operations == []
+    assert any(question.topic == "column" for question in ambiguous.clarification_questions)
+
+
 def test_missing_type_asks_for_clarification() -> None:
     proposal = propose_migration(_snapshot(), "Add a nullable nickname column to users")
     assert proposal.status == "needs_clarification"

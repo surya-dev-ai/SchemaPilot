@@ -4,8 +4,9 @@ from fastapi import APIRouter, HTTPException, Request
 
 from app.core.config import Settings
 from app.schemas.domain import SchemaSnapshot, SourceListResponse
-from app.services.schema_inspector import inspect_source
+from app.services.schema_inspector import inspect_sandbox, inspect_source
 from app.services.source_manager import (
+    SANDBOX_SOURCE_ID,
     SourceNotConfiguredError,
     SourceNotFoundError,
     SourceNotReadOnlyError,
@@ -27,6 +28,8 @@ def get_sources(request: Request) -> SourceListResponse:
 def get_source_schema(source_id: str, request: Request) -> SchemaSnapshot:
     settings: Settings = request.app.state.settings
     try:
+        if source_id == SANDBOX_SOURCE_ID:
+            return inspect_sandbox(settings)
         return inspect_source(settings, source_id)
     except SourceNotFoundError:
         raise HTTPException(status_code=404, detail={"error": "unknown_source"}) from None

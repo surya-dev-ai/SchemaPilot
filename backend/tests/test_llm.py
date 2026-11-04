@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
+from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request
 
 import pytest
 from app.core.config import Settings, clear_settings_cache
@@ -21,11 +25,14 @@ from app.schemas.report import SafetyReport
 from app.schemas.risk import RiskAssessment
 from app.services.llm.assisted_planner import create_proposal
 from app.services.llm.provider import (
+    AzureOpenAIProvider,
     CallableProvider,
     LlmProviderError,
+    OpenAICompatibleProvider,
+    build_provider,
     parse_provider_json,
 )
-from app.services.llm.schema_context import build_schema_context
+from app.services.llm.schema_context import build_schema_context, user_prompt
 from app.services.planner import propose_from_llm_payload, propose_migration
 from app.services.risk_engine import assess_risk
 from app.services.workflow_store import create_tables, persist_workflow
@@ -104,31 +111,13 @@ def test_parse_valid_structured_provider_output() -> None:
     assert parsed.operations[0].column == "nickname"
 
 
-def test_normalize_azure_style_aliases() -> None:
-    parsed = parse_provider_json(
-        {
-            "schema_fingerprint": "fingerprint-1",
-            "summary": "Add nickname",
-            "assumptions": ["optional text"],
-            "clarification_questions": ["Should nickname be unique?"],
-            "operations": [
-                {
-                    "action": "add_column",
-                    "table_name": "users",
-                    "column_name": "nickname",
-                    "data_type": "text",
-                    "nullable": True,
-                    "index_columns": None,
-                }
-            ],
-        }
+def test_prompt_lists_allowed_clarification_topics() -> None:
+    prompt = user_prompt("Add a column to users", build_schema_context(_snapshot()))
+    allowed_topics = (
+        "topic must be exactly one of table, column, data_type, "
+        "behavior, constraint, or index"
     )
-    assert parsed.operations[0].kind == "add_column"
-    assert parsed.operations[0].table == "users"
-    assert parsed.operations[0].column == "nickname"
-    assert parsed.operations[0].index_columns == []
-    assert parsed.clarification_questions[0].topic == "behavior"
-    assert "unique" in parsed.clarification_questions[0].text.lower()
+    assert allowed_topics in prompt
 
 
 def test_malformed_and_sql_bearing_responses_are_rejected() -> None:
@@ -143,6 +132,184 @@ def test_malformed_and_sql_bearing_responses_are_rejected() -> None:
 
     with pytest.raises(LlmProviderError):
         parse_provider_json(_valid_payload(operations=[{"kind": "run_sql", "table": "users"}]))
+
+
+def test_schema_validation_error_is_actionable_without_echoing_provider_data() -> None:
+    payload = _valid_payload(
+        operations=[
+            {
+                "kind": "add_column",
+                "table": "users",
+                "column": "phone_number",
+                "data_type": "text",
+                "nullable": True,
+            }
+        ]
+    )
+    payload["operations"][0]["kind"] = "unrecognized_provider_value"
+
+    with pytest.raises(LlmProviderError) as malformed:
+        parse_provider_json(payload)
+
+    assert malformed.value.status == "malformed"
+    assert "invalid value for operations.kind" in malformed.value.message
+    assert "unrecognized_provider_value" not in malformed.value.message
+
+    with pytest.raises(LlmProviderError) as extra_field:
+        parse_provider_json(_valid_payload(provider_secret="must-not-be-echoed"))
+
+    assert extra_field.value.status == "malformed"
+    assert "provider_secret" not in extra_field.value.message
+    assert "must-not-be-echoed" not in extra_field.value.message
+
+
+def test_structured_output_400_retries_once_in_json_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+    valid_envelope = {"choices": [{"message": {"content": json.dumps(_valid_payload())}}]}
+
+    def fake_urlopen(request: Request, timeout: float):
+        del timeout
+        calls.append(json.loads(request.data or b"{}"))
+        if len(calls) == 1:
+            body = json.dumps(
+                {"error": {"param": "response_format", "message": "unsupported"}}
+            ).encode()
+            raise HTTPError(request.full_url, 400, "Bad Request", None, BytesIO(body))
+        return nullcontext(BytesIO(json.dumps(valid_envelope).encode()))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    provider = OpenAICompatibleProvider(Settings(llm_enabled=True, llm_api_key="test-key"))
+
+    result = provider.interpret("Add a nullable nickname column to users", _snapshot())
+
+    assert result.payload.operations[0].column == "nickname"
+    assert len(calls) == 2
+    assert calls[0]["response_format"]["type"] == "json_schema"  # type: ignore[index]
+    assert calls[1]["response_format"] == {"type": "json_object"}
+
+
+def test_non_format_http_400_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+
+    def fake_urlopen(request: Request, timeout: float):
+        nonlocal calls
+        del timeout
+        calls += 1
+        body = json.dumps({"error": {"param": "messages", "message": "bad request"}}).encode()
+        raise HTTPError(request.full_url, 400, "Bad Request", None, BytesIO(body))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    provider = OpenAICompatibleProvider(Settings(llm_enabled=True, llm_api_key="test-key"))
+
+    with pytest.raises(LlmProviderError, match="HTTP error 400"):
+        provider.interpret("Add a nullable nickname column to users", _snapshot())
+
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_status"),
+    [(401, "error"), (403, "error"), (404, "error"), (429, "rate_limited")],
+)
+def test_azure_auth_deployment_and_throttle_failures_are_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    expected_status: str,
+) -> None:
+    calls = 0
+
+    def fake_urlopen(request: Request, timeout: float):
+        nonlocal calls
+        del timeout
+        calls += 1
+        body = b"provider diagnostic contains private response data"
+        raise HTTPError(request.full_url, status_code, "Provider failure", None, BytesIO(body))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    provider = AzureOpenAIProvider(
+        Settings(
+            llm_enabled=True,
+            llm_api_key="test-secret-key",
+            llm_api_base="https://resource.openai.azure.com/openai/v1",
+        )
+    )
+
+    with pytest.raises(LlmProviderError) as failure:
+        provider.interpret("Add a nullable nickname column to users", _snapshot())
+
+    assert failure.value.status == expected_status
+    assert "private response data" not in failure.value.message
+    assert "test-secret-key" not in failure.value.message
+    assert calls == 1
+
+
+@pytest.mark.parametrize("failure", [TimeoutError(), URLError(TimeoutError())])
+def test_azure_network_timeouts_are_reported_without_provider_details(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+) -> None:
+    def fake_urlopen(_request: Request, timeout: float):
+        del timeout
+        raise failure
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    provider = AzureOpenAIProvider(
+        Settings(
+            llm_enabled=True,
+            llm_api_key="test-secret-key",
+            llm_api_base="https://resource.openai.azure.com/openai/v1",
+        )
+    )
+
+    with pytest.raises(LlmProviderError) as timed_out:
+        provider.interpret("Add a nullable nickname column to users", _snapshot())
+
+    assert timed_out.value.status == "timeout"
+    assert timed_out.value.message == "LLM provider timed out."
+    assert "test-secret-key" not in timed_out.value.message
+
+
+def test_azure_openai_v1_uses_api_key_header_and_deployment_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[Request] = []
+    envelope = {"choices": [{"message": {"content": json.dumps(_valid_payload())}}]}
+
+    def fake_urlopen(request: Request, timeout: float):
+        del timeout
+        captured.append(request)
+        return nullcontext(BytesIO(json.dumps(envelope).encode()))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    settings = Settings(
+        llm_enabled=True,
+        llm_api_key="azure-test-key",
+        llm_api_base="https://resource.openai.azure.com/openai/v1",
+        llm_model="schema-deployment",
+        llm_provider="azure_openai",
+    )
+
+    provider = build_provider(settings)
+    assert isinstance(provider, AzureOpenAIProvider)
+    result = provider.interpret("Add a nullable nickname column to users", _snapshot())
+
+    assert result.provider_name == "azure_openai"
+    assert captured[0].full_url == ("https://resource.openai.azure.com/openai/v1/chat/completions")
+    assert captured[0].get_header("Api-key") == "azure-test-key"
+    assert captured[0].get_header("Authorization") is None
+    sent_body = json.loads(captured[0].data or b"{}")
+    assert sent_body["model"] == "schema-deployment"
+
+
+def test_azure_openai_rejects_non_v1_or_non_azure_endpoint() -> None:
+    settings = Settings(
+        llm_enabled=True,
+        llm_api_key="azure-test-key",
+        llm_api_base="https://api.example.test/v1",
+        llm_provider="azure_openai",
+    )
+    with pytest.raises(LlmProviderError, match="Azure OpenAI requires"):
+        build_provider(settings)
 
 
 def test_schema_comments_are_untrusted_and_do_not_become_instructions() -> None:
@@ -285,8 +452,13 @@ def test_policy_blocked_and_not_run_still_block_eligibility() -> None:
     )
     assessment = assess_risk(_snapshot(), proposal)
     assert assessment.policy_blocked or not assessment.artifact_eligible
-    assert any(finding.data_check == "not_run" or finding.disposition == "policy_blocked"
-               for finding in assessment.findings) or not assessment.artifact_eligible
+    assert (
+        any(
+            finding.data_check == "not_run" or finding.disposition == "policy_blocked"
+            for finding in assessment.findings
+        )
+        or not assessment.artifact_eligible
+    )
 
 
 def test_model_sql_is_never_executed(monkeypatch: pytest.MonkeyPatch) -> None:

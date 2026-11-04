@@ -26,6 +26,7 @@ from app.services.migration_generator import (
 )
 from app.services.planner import propose_migration
 from app.services.risk_engine import assess_risk
+from app.services.validator import assert_alembic_matches, parse_upgrade_sql
 from fastapi.testclient import TestClient
 
 MALICIOUS = USER_TABLE_COMMENT
@@ -473,6 +474,32 @@ def test_low_static_score_does_not_generate_a_constraint(tmp_path: Path) -> None
         generate_migration(snapshot, proposal, assessment, tmp_path)
     assert exc.value.code == "unsupported_operation"
     assert "not a passed live row check" in exc.value.message
+
+
+def test_drop_column_generates_sandbox_only_review_artifact(tmp_path: Path) -> None:
+    snapshot = _snapshot()
+    proposal = propose_migration(snapshot, "Drop the column, order, status from orders.")
+    assessment = assess_risk(snapshot, proposal)
+
+    assert proposal.status == "proposed"
+    assert len(proposal.operations) == 1
+    assert proposal.operations[0].kind == "destructive"
+    assert assessment.policy_blocked is True
+    assert assessment.artifact_eligible is False
+
+    artifact = generate_migration(snapshot, proposal, assessment, tmp_path)
+
+    assert artifact.sandbox_only is True
+    assert artifact.applied is False
+    assert artifact.sql_preview == 'ALTER TABLE "bookstore"."orders" DROP COLUMN "status";'
+    assert artifact.downgrade_sql == (
+        'ALTER TABLE "bookstore"."orders" ADD COLUMN "status" TEXT NULL;'
+    )
+    assert artifact.reversibility == "partially_reversible"
+    assert artifact.operation_reversibility[0].data_loss_on_downgrade is True
+    statements = parse_upgrade_sql(artifact.sql_preview)
+    assert statements[0].kind == "destructive"
+    assert_alembic_matches(artifact, statements)
 
 
 def test_unsupported_plan_and_tampered_assessment_are_rejected(tmp_path: Path) -> None:

@@ -1,5 +1,10 @@
-import { describe, expect, it } from "vitest";
-import { approvalUiAllowed, rollbackLabel, toApiError } from "./client";
+import { describe, expect, it, vi } from "vitest";
+import {
+  approvalUiAllowed,
+  getSandboxCheckpointSession,
+  rollbackLabel,
+  toApiError,
+} from "./client";
 import type { WorkflowDetail } from "./types";
 
 function detail(overrides: Partial<WorkflowDetail> = {}): WorkflowDetail {
@@ -11,6 +16,7 @@ function detail(overrides: Partial<WorkflowDetail> = {}): WorkflowDetail {
     artifact_status: "generated",
     artifact_applied: false,
     schema_fingerprint: "fingerprint-1",
+    visibility: "shared",
     state: "report_ready",
     report_checksum: "sha256:report",
     evidence_fingerprint: "sha256:evidence",
@@ -30,7 +36,11 @@ function detail(overrides: Partial<WorkflowDetail> = {}): WorkflowDetail {
       artifact_status: "generated",
       risk_findings: [],
       sandbox: null,
+      baseline_evidence: null,
+      downgrade_executed: false,
       rollback_status: "partial_restoration",
+      snapshot_recovery: null,
+      snapshot_session_id: null,
       data_loss_limitations: [
         "Recreating a dropped column does not restore its former values.",
       ],
@@ -55,6 +65,39 @@ describe("rollbackLabel", () => {
     expect(rollbackLabel("partial_restoration")).toBe("Partial restoration");
     expect(rollbackLabel("failed")).toBe("Failed");
     expect(rollbackLabel("not_verified")).toBe("Not verified");
+  });
+});
+
+describe("getSandboxCheckpointSession", () => {
+  it("discovers an interrupted sandbox session without exposing checkpoint internals", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          active: true,
+          migration_id: "sp0123456789ab",
+          snapshot_session_id: "a".repeat(32),
+          state: "recovery_required",
+          checkpoint_verified: true,
+          restore_status: "verification_incomplete",
+          error: null,
+        }),
+        { status: 200 },
+      ),
+    );
+    globalThis.fetch = fetchMock;
+    try {
+      const status = await getSandboxCheckpointSession();
+      expect(fetchMock).toHaveBeenCalled();
+      expect(fetchMock.mock.calls[0][0]).toBe(
+        "/api/v1/sources/sandbox/sandbox-session",
+      );
+      expect(status.active).toBe(true);
+      expect(status.state).toBe("recovery_required");
+      expect("checkpoint_id" in status).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
 

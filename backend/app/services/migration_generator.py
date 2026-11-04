@@ -70,8 +70,16 @@ def generate_migration(
     """Write a review artifact. The same operations produce the SQL and the module."""
     directory = _safe_output_dir(output_dir)
     _require_provenance(snapshot, proposal, assessment)
-    _require_eligible(assessment)
-    rendered = [_render(snapshot, operation, assessment) for operation in proposal.operations]
+    sandbox_review = (
+        _is_sandbox_only_destructive(snapshot, proposal)
+        and _sandbox_only_review_plan(assessment)
+        and proposal.operations[0].destructive is True
+    )
+    _require_eligible(assessment, sandbox_review=sandbox_review)
+    rendered = [
+        _render(snapshot, operation, assessment, sandbox_review=sandbox_review)
+        for operation in proposal.operations
+    ]
     migration_id = _migration_id(snapshot, proposal.operations)
     summary = " ".join(operation.summary for operation in proposal.operations)
     sql_preview = "\n".join(item.upgrade_sql for item in rendered)
@@ -94,6 +102,7 @@ def generate_migration(
         summary=summary,
         status="generated",
         applied=False,
+        sandbox_only=_is_sandbox_only_destructive(snapshot, proposal),
         operation_ids=[operation.id for operation in proposal.operations],
         sql_preview=sql_preview,
         downgrade_sql=downgrade_sql,
@@ -156,13 +165,16 @@ def _require_provenance(
         )
 
 
-def _require_eligible(assessment: RiskAssessment) -> None:
+def _require_eligible(assessment: RiskAssessment, *, sandbox_review: bool = False) -> None:
     if assessment.plan_status != "proposed":
         raise ArtifactRejectedError(
             "plan_not_proposed",
             "Only a proposed plan can be generated.",
         )
-    if any(finding.disposition == "policy_blocked" for finding in assessment.findings):
+    if (
+        any(finding.disposition == "policy_blocked" for finding in assessment.findings)
+        and not sandbox_review
+    ):
         raise ArtifactRejectedError(
             "policy_blocked",
             "Policy-blocked operations are not generated.",
@@ -177,7 +189,9 @@ def _require_eligible(assessment: RiskAssessment) -> None:
             "no_operations",
             "The plan has no operations to generate.",
         )
-    if not assessment.artifact_eligible or assessment.eligibility_reason != "eligible":
+    if not sandbox_review and (
+        not assessment.artifact_eligible or assessment.eligibility_reason != "eligible"
+    ):
         raise ArtifactRejectedError(
             "unsafe_to_generate",
             "The plan is not eligible for an artifact.",
@@ -188,12 +202,13 @@ def _render(
     snapshot: SchemaSnapshot,
     operation: PlanOperation,
     assessment: RiskAssessment,
+    *,
+    sandbox_review: bool = False,
 ) -> _Rendered:
     if operation.kind == "destructive":
-        raise ArtifactRejectedError(
-            "unsupported_operation",
-            "Destructive operations are not generated.",
-        )
+        if sandbox_review and operation.column is not None:
+            return _render_drop_column(snapshot, operation)
+        raise ArtifactRejectedError("policy_blocked", "Table drops are not generated.")
     if operation.kind == "add_constraint":
         raise ArtifactRejectedError(
             "unsupported_operation",
@@ -218,6 +233,103 @@ def _render(
         "unsupported_operation",
         "This operation type is not generated.",
     )
+
+
+def _sandbox_only_review_plan(assessment: RiskAssessment) -> bool:
+    """Recognize only the policy-blocked drop-column assessment for review."""
+    return (
+        assessment.source_id in {"bookstore-demo", "sandbox"}
+        and assessment.schema_name == "bookstore"
+        and assessment.plan_status == "proposed"
+        and assessment.eligibility_reason == "policy_blocked"
+        and len(assessment.findings) > 0
+        and all(
+            finding.disposition in {"policy_blocked", "high_risk"}
+            and finding.rule_id in {"SP-R002", "SP-R017"}
+            for finding in assessment.findings
+        )
+        and any(finding.rule_id == "SP-R002" for finding in assessment.findings)
+    )
+
+
+def _is_sandbox_only_destructive(snapshot: SchemaSnapshot, proposal: MigrationProposal) -> bool:
+    return (
+        snapshot.source_id in {"bookstore-demo", "sandbox"}
+        and snapshot.schema_name == "bookstore"
+        and len(proposal.operations) == 1
+        and proposal.operations[0].kind == "destructive"
+        and proposal.operations[0].column is not None
+    )
+
+
+def _render_drop_column(snapshot: SchemaSnapshot, operation: PlanOperation) -> _Rendered:
+    """Render a schema-checked column drop for sandbox review only."""
+    schema = _ident(snapshot.schema_name, "schema")
+    table = _ident(operation.table, "table")
+    column = _ident(operation.column, "column")
+    original = next(
+        (item for table_snapshot in snapshot.tables if table_snapshot.name == table
+         for item in table_snapshot.columns if item.name == column),
+        None,
+    )
+    if original is None:
+        raise ArtifactRejectedError("unsafe_to_generate", "The column is absent from the snapshot.")
+    type_sql = _existing_type_sql(original.data_type)
+    upgrade_sql = f"ALTER TABLE {_qualified(schema, table)} DROP COLUMN {_quote(column)};"
+    downgrade_sql = (
+        f"ALTER TABLE {_qualified(schema, table)} ADD COLUMN {_quote(column)} {type_sql} NULL;"
+    )
+    upgrade_code = f"    op.drop_column({_py(table)}, {_py(column)}, schema={_py(schema)})"
+    downgrade_code = (
+        f"    op.add_column({_py(table)}, sa.Column({_py(column)}, "
+        f"{_existing_type_alembic(original.data_type)}, nullable=True), schema={_py(schema)})"
+    )
+    return _Rendered(
+        upgrade_sql=upgrade_sql,
+        downgrade_sql=downgrade_sql,
+        upgrade_code=upgrade_code,
+        downgrade_code=downgrade_code,
+        uses_timestamptz=original.data_type.lower() == "timestamp with time zone",
+        reversibility=OperationReversibility(
+            operation_id=operation.id,
+            kind=operation.kind,
+            reversibility="partially_reversible",
+            upgrade_effect=f"Drop {schema}.{table}.{column}; stored values are discarded.",
+            downgrade_effect=(
+                f"Recreate {schema}.{table}.{column} as nullable {original.data_type}; "
+                "the original values and nullability are not restored."
+            ),
+            data_loss_on_downgrade=True,
+        ),
+    )
+
+
+def _existing_type_sql(data_type: str) -> str:
+    normalized = data_type.lower()
+    allowed = {
+        "text": "TEXT",
+        "integer": "INTEGER",
+        "bigint": "BIGINT",
+        "boolean": "BOOLEAN",
+        "timestamp with time zone": "TIMESTAMP WITH TIME ZONE",
+    }
+    if normalized not in allowed:
+        raise ArtifactRejectedError("unsupported_operation", "This column type is not previewable.")
+    return allowed[normalized]
+
+
+def _existing_type_alembic(data_type: str) -> str:
+    normalized = data_type.lower()
+    allowed = {
+        "text": "sa.Text()",
+        "integer": "sa.Integer()",
+        "bigint": "sa.BigInteger()",
+        "boolean": "sa.Boolean()",
+        "timestamp with time zone": "postgresql.TIMESTAMP(timezone=True)",
+    }
+    if normalized not in allowed:
+        raise ArtifactRejectedError("unsupported_operation", "This column type is not previewable.")
+    return allowed[normalized]
 
 
 def _render_column(snapshot: SchemaSnapshot, operation: PlanOperation) -> _Rendered:

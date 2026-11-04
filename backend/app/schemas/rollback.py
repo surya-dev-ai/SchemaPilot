@@ -1,8 +1,8 @@
-"""Rollback evidence. These models do not approve or apply a target migration."""
+"""Rollback and sandbox checkpoint evidence; neither approves nor applies targets."""
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.sandbox import SandboxCheck, SandboxRun
 
@@ -13,6 +13,16 @@ RollbackStatus = Literal[
     "not_verified",
 ]
 
+BackupStatus = Literal["verified", "failed", "unavailable", "not_created"]
+SnapshotRestoreStatus = Literal[
+    "restore_verified",
+    "restore_partially_verified",
+    "restore_failed",
+    "verification_incomplete",
+    "backup_unavailable",
+    "not_attempted",
+]
+
 
 class BaselineEvidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -21,6 +31,26 @@ class BaselineEvidence(BaseModel):
     tables: list[str]
     row_counts: dict[str, int]
     emails: list[str]
+
+
+class SnapshotRecoveryReport(BaseModel):
+    """Evidence for a retained PostgreSQL template-clone checkpoint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    checkpoint_id: str | None = None
+    captured_at: str | None = None
+    backup_status: BackupStatus = "not_created"
+    restore_status: SnapshotRestoreStatus = "not_attempted"
+    baseline_schema_fingerprint: str | None = None
+    restored_schema_fingerprint: str | None = None
+    baseline_data_fingerprint: str | None = None
+    restored_data_fingerprint: str | None = None
+    schema_match: bool | None = None
+    data_match: bool | None = None
+    verification_checks: list[SandboxCheck] = Field(default_factory=list)
+    checkpoint_retained: bool = False
+    error: str | None = None
 
 
 class RollbackReport(BaseModel):
@@ -44,3 +74,6 @@ class RollbackReport(BaseModel):
     data_checks: list[SandboxCheck]
     data_loss_limitations: list[str]
     error: str | None = None
+    snapshot_recovery: SnapshotRecoveryReport | None = None
+    preexisting_sandbox_recovery: SnapshotRecoveryReport | None = None
+    snapshot_session_id: str | None = None

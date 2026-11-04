@@ -33,6 +33,7 @@ class MigrationArtifact(BaseModel):
     summary: str
     status: ArtifactStatus
     applied: Literal[False] = False
+    sandbox_only: bool = False
     operation_ids: list[str]
     sql_preview: str
     downgrade_sql: str

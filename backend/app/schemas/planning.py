@@ -4,18 +4,17 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.schemas.interpretation import (
-    InterpretationPath,
-    LlmSuggestionSummary,
-    ProviderStatus,
-)
-from app.schemas.operation_kinds import (
-    ClarificationTopic,
-    ConstraintRequestKind,
-    OperationKind,
-)
-
+OperationKind = Literal[
+    "add_column",
+    "add_index",
+    "rename_column",
+    "rename_table",
+    "add_constraint",
+    "destructive",
+]
+ConstraintRequestKind = Literal["unique", "not_null", "check"]
 PlanStatus = Literal["proposed", "needs_clarification", "rejected"]
+ClarificationTopic = Literal["table", "column", "data_type", "behavior", "constraint", "index"]
 ValidationCode = Literal[
     "unknown_table",
     "unknown_column",
@@ -27,6 +26,13 @@ ValidationCode = Literal[
     "unsupported_operation",
     "malformed_request",
 ]
+
+# Imported after local Literals so interpretation can reuse OperationKind safely.
+from app.schemas.interpretation import (  # noqa: E402
+    InterpretationPath,
+    LlmSuggestionSummary,
+    ProviderStatus,
+)
 
 
 class PlanCreateRequest(BaseModel):

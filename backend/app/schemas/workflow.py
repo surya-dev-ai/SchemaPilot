@@ -13,6 +13,7 @@ WorkflowState = Literal[
     "blocked",
 ]
 ApprovalDecision = Literal["recorded", "rejected"]
+WorkflowVisibility = Literal["shared", "private"]
 
 
 class WorkflowSummary(BaseModel):
@@ -23,6 +24,7 @@ class WorkflowSummary(BaseModel):
     migration_id: str
     artifact_checksum: str
     schema_fingerprint: str
+    visibility: WorkflowVisibility = "shared"
     state: WorkflowState
     eligible_for_review: bool
     report_stale: bool
@@ -71,6 +73,7 @@ class WorkflowDetail(BaseModel):
     artifact_status: str
     artifact_applied: Literal[False] = False
     schema_fingerprint: str
+    visibility: WorkflowVisibility = "shared"
     state: WorkflowState
     report_checksum: str
     evidence_fingerprint: str
@@ -91,6 +94,8 @@ class WorkflowPersistRequest(BaseModel):
     request: str = Field(min_length=1, max_length=2000)
     confirm: bool
     use_llm: bool = False
+    visibility: WorkflowVisibility = "shared"
+    snapshot_session_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
 
     @field_validator("request")
     @classmethod

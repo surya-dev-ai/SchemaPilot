@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine.url import make_url
 
@@ -26,8 +27,23 @@ class Settings(BaseSettings):
     allow_sandbox_execution: bool = False
     target_execution_enabled: bool = False
     allow_app_migrations: bool = False
-    # Real authentication is not implemented. Keep false until a provider exists.
+    # Computed from auth_required and complete OIDC configuration.
     authentication_available: bool = False
+    auth_required: bool = False
+    oidc_metadata_url: str | None = None
+    oidc_client_id: str | None = None
+    oidc_client_secret: str | None = None
+    oidc_redirect_uri: str | None = None
+    auth_frontend_url: str = "http://127.0.0.1:5175"
+    auth_session_secret: str | None = None
+    auth_cookie_secure: bool = True
+    auth_role_claim: str = "roles"
+    auth_group_claim: str = "groups"
+    auth_team_groups: str = ""
+    auth_admin_roles: str = "admin"
+    auth_engineer_roles: str = "engineer"
+    auth_approver_roles: str = "approver"
+    auth_viewer_roles: str = "viewer"
     # Optional LLM assist. Credentials stay server-side; defaults keep LLM off.
     llm_enabled: bool = False
     llm_api_key: str | None = None
@@ -42,6 +58,26 @@ class Settings(BaseSettings):
         env_file=".env",
         extra="ignore",
     )
+
+    @model_validator(mode="after")
+    def validate_auth_configuration(self) -> "Settings":
+        oidc_values = (
+            self.oidc_metadata_url,
+            self.oidc_client_id,
+            self.oidc_client_secret,
+            self.oidc_redirect_uri,
+            self.auth_session_secret,
+        )
+        configured = all(value and value.strip() for value in oidc_values)
+        if self.auth_required and not configured:
+            raise ValueError(
+                "OIDC auth requires metadata URL, client ID/secret, redirect URI, "
+                "and a session secret."
+            )
+        if self.auth_required and self.auth_session_secret and len(self.auth_session_secret) < 32:
+            raise ValueError("SCHEMAPILOT_AUTH_SESSION_SECRET must be at least 32 characters.")
+        self.authentication_available = bool(self.auth_required and configured)
+        return self
 
     @property
     def cors_origin_list(self) -> list[str]:

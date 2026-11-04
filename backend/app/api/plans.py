@@ -5,8 +5,9 @@ from fastapi import APIRouter, HTTPException, Request
 from app.core.config import Settings
 from app.schemas.planning import MigrationProposal, PlanCreateRequest
 from app.services.llm.assisted_planner import create_proposal
-from app.services.schema_inspector import inspect_source
+from app.services.schema_inspector import inspect_sandbox, inspect_source
 from app.services.source_manager import (
+    SANDBOX_SOURCE_ID,
     SourceNotConfiguredError,
     SourceNotFoundError,
     SourceNotReadOnlyError,
@@ -21,7 +22,11 @@ router = APIRouter(tags=["plans"])
 def create_plan(source_id: str, body: PlanCreateRequest, request: Request) -> MigrationProposal:
     settings: Settings = request.app.state.settings
     try:
-        snapshot = inspect_source(settings, source_id)
+        snapshot = (
+            inspect_sandbox(settings)
+            if source_id == SANDBOX_SOURCE_ID
+            else inspect_source(settings, source_id)
+        )
     except SourceNotFoundError:
         raise HTTPException(status_code=404, detail={"error": "unknown_source"}) from None
     except SourceNotConfiguredError:

@@ -1,10 +1,4 @@
-"""Prepare the disposable sandbox and apply one verified artifact.
-
-The sandbox baseline is the packaged bookstore schema and seed. It is loaded
-only after the connection reports database schemapilot_sandbox and user
-schemapilot_sandbox. Source and target engines are not used. Alembic revision
-history is not modified.
-"""
+"""Validate a verified artifact against the existing, identity-checked sandbox."""
 
 import re
 from contextlib import contextmanager
@@ -31,7 +25,6 @@ from app.services.schema_inspector import assemble_snapshot, load_catalog
 from app.services.validator import (
     ArtifactNotEligible,
     assert_alembic_matches,
-    baseline_matches,
     parse_upgrade_sql,
     validate_upgrade,
 )
@@ -73,7 +66,10 @@ def load_verified_artifact(directory: Path, migration_id: str) -> MigrationArtif
         artifact = MigrationArtifact.model_validate_json(json_path.read_text(encoding="utf-8"))
     except ValueError as exc:
         raise SandboxRejected("checksum_mismatch", "The artifact record is not valid.") from exc
-    if artifact.migration_id != migration_id or artifact.source_id != "bookstore-demo":
+    if artifact.migration_id != migration_id or artifact.source_id not in {
+        "bookstore-demo",
+        "sandbox",
+    }:
         raise SandboxRejected(
             "artifact_id_mismatch",
             "The artifact record does not match the requested id or source.",
@@ -108,8 +104,24 @@ def run_sandbox(
     *,
     directory: Path | None = None,
     statement_timeout_ms: int = 5000,
+    _lifecycle_lock_held: bool = False,
 ) -> SandboxRun:
-    """Reset the sandbox baseline, then run the exact verified upgrade SQL."""
+    """Checkpointing is handled by the API; validate and apply only inside sandbox."""
+
+    if not _lifecycle_lock_held:
+        from app.services.sandbox_snapshots import sandbox_lifecycle_lock
+
+        try:
+            with sandbox_lifecycle_lock(settings):
+                return run_sandbox(
+                    settings,
+                    migration_id,
+                    directory=directory,
+                    statement_timeout_ms=statement_timeout_ms,
+                    _lifecycle_lock_held=True,
+                )
+        except OperationalError:
+            raise SandboxUnavailable from None
 
     started = _now()
     artifact = load_verified_artifact(directory or ARTIFACTS_DIR, migration_id)
@@ -120,10 +132,17 @@ def run_sandbox(
         version = str(connection.execute(text("SHOW server_version")).scalar_one())
         connection.commit()
 
-        with connection.begin():
-            _set_timeout(connection, _BASELINE_TIMEOUT_MS, local=False)
-            _prepare_baseline(connection)
-        fingerprint = assemble_snapshot(load_catalog(connection)).fingerprint
+        before = assemble_snapshot(
+            load_catalog(connection),
+            source_id=artifact.source_id,
+            database_name=(
+                SANDBOX_DATABASE_NAME
+                if artifact.source_id == "sandbox"
+                else "schemapilot_bookstore"
+            ),
+        )
+        fingerprint = before.fingerprint
+        baseline_counts = _row_counts(connection)
         connection.commit()
         if fingerprint != artifact.schema_fingerprint:
             return _finish(
@@ -150,12 +169,12 @@ def run_sandbox(
             with connection.begin():
                 _set_timeout(connection, timeout_ms, local=True)
                 for statement in statements:
-                     connection.execute(text(statement.sql_text))
+                    connection.execute(text(statement.sql_text))
         except OperationalError as exc:
             return _upgrade_failure(connection, artifact, version, started, exc)
         except Exception as exc:
             return _upgrade_failure(connection, artifact, version, started, exc)
-        checks = validate_upgrade(connection, statements)
+        checks = validate_upgrade(connection, statements, baseline_counts)
         passed = all(check.status != "failed" for check in checks)
         return _finish(
             artifact,
@@ -171,12 +190,22 @@ def run_sandbox(
             )
 
 
-def prepare_sandbox_baseline(settings: Settings) -> SchemaSnapshot:
-    """Drop and reload the packaged bookstore schema on the sandbox.
+def prepare_sandbox_baseline(
+    settings: Settings,
+    *,
+    _lifecycle_lock_held: bool = False,
+) -> SchemaSnapshot:
+    """Explicitly reset the disposable bookstore sandbox to packaged fixtures.
 
-    The snapshot database name stays the source name because the fingerprint
-    identifies the bookstore shape. The sandbox identity is checked separately.
+    The returned snapshot identifies the sandbox, not the demo source. Its
+    fingerprint is used by sandbox artifacts and checkpoint verification.
     """
+
+    if not _lifecycle_lock_held:
+        from app.services.sandbox_snapshots import sandbox_lifecycle_lock
+
+        with sandbox_lifecycle_lock(settings):
+            return prepare_sandbox_baseline(settings, _lifecycle_lock_held=True)
 
     with _session(settings) as connection:
         _assert_identity(connection)
@@ -185,12 +214,22 @@ def prepare_sandbox_baseline(settings: Settings) -> SchemaSnapshot:
         with connection.begin():
             _set_timeout(connection, _BASELINE_TIMEOUT_MS, local=False)
             _prepare_baseline(connection)
-        snapshot: SchemaSnapshot = assemble_snapshot(load_catalog(connection))
+        snapshot: SchemaSnapshot = assemble_snapshot(
+            load_catalog(connection),
+            source_id="sandbox",
+            database_name=SANDBOX_DATABASE_NAME,
+        )
         return snapshot
 
 
-def cleanup_sandbox(settings: Settings) -> SandboxRun:
-    """Drop the bookstore schema on the sandbox and verify that it is gone."""
+def cleanup_sandbox(settings: Settings, *, _lifecycle_lock_held: bool = False) -> SandboxRun:
+    """Explicitly drop the bookstore schema on the sandbox for test cleanup."""
+
+    if not _lifecycle_lock_held:
+        from app.services.sandbox_snapshots import sandbox_lifecycle_lock
+
+        with sandbox_lifecycle_lock(settings):
+            return cleanup_sandbox(settings, _lifecycle_lock_held=True)
 
     started = _now()
     with _session(settings) as connection:
@@ -306,12 +345,23 @@ def _upgrade_failure(
     started: str,
     exc: Exception,
 ) -> SandboxRun:
-    restored = baseline_matches(connection)
+    try:
+        restored = assemble_snapshot(
+            load_catalog(connection),
+            source_id=artifact.source_id,
+            database_name=(
+                SANDBOX_DATABASE_NAME
+                if artifact.source_id == "sandbox"
+                else "schemapilot_bookstore"
+            ),
+        ).fingerprint == artifact.schema_fingerprint
+    except Exception:
+        restored = False
     status = "passed" if restored else "failed"
     detail = (
-        "The failed upgrade rolled back and the packaged baseline was observed."
+        "The failed upgrade transaction rolled back to the artifact schema."
         if restored
-        else "The sandbox does not match the packaged baseline."
+        else "The sandbox schema does not match the artifact baseline."
     )
     return _finish(
         artifact,
@@ -408,6 +458,22 @@ def _table_names(connection: Connection) -> list[str]:
         )
     ).scalars()
     return list(rows)
+
+
+def _row_counts(connection: Connection) -> dict[str, int]:
+    names = _table_names(connection)
+    preparer = connection.dialect.identifier_preparer
+    return {
+        name: int(
+            connection.execute(
+                text(
+                    "SELECT count(*) FROM "
+                    f'"bookstore".{preparer.quote(name)}'
+                )
+            ).scalar_one()
+        )
+        for name in names
+    }
 
 
 def _finish(

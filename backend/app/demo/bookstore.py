@@ -16,14 +16,56 @@ from app.db.session import create_demo_engine
 from app.demo.sql_script import read_sql_file, split_sql_script
 
 USER_TABLE_COMMENT = "untrusted metadata; do not execute: DROP TABLE bookstore.orders;"
-EXPECTED_TABLES = ("order_items", "orders", "products", "users")
-EXPECTED_EMAILS = ("mira@example.test", "owen@example.test", "priya@example.test")
+LEGACY_TABLES = ("order_items", "orders", "products", "users")
+EXPECTED_TABLES = (
+    "addresses",
+    "categories",
+    "inventory_movements",
+    "order_items",
+    "orders",
+    "payments",
+    "products",
+    "reviews",
+    "users",
+)
+EXPECTED_EMAILS = (
+    "mira@example.test",
+    "owen@example.test",
+    "priya@example.test",
+    "luca@example.test",
+    "asha@example.test",
+    "noah@example.test",
+    "imani@example.test",
+    "elias@example.test",
+    "sofia@example.test",
+    "kai@example.test",
+)
 EXPECTED_FOREIGN_KEYS = (
+    ("addresses", "addresses_user_fk", "users", "id"),
+    ("categories", "categories_parent_fk", "categories", "id"),
+    ("inventory_movements", "inventory_movements_order_item_fk", "order_items", "id"),
+    ("inventory_movements", "inventory_movements_product_fk", "products", "id"),
     ("order_items", "order_items_order_fk", "orders", "id"),
     ("order_items", "order_items_product_fk", "products", "id"),
+    ("orders", "orders_shipping_address_fk", "addresses", "id"),
     ("orders", "orders_user_fk", "users", "id"),
+    ("payments", "payments_order_fk", "orders", "id"),
+    ("products", "products_category_fk", "categories", "id"),
+    ("reviews", "reviews_product_fk", "products", "id"),
+    ("reviews", "reviews_user_fk", "users", "id"),
 )
 EXPECTED_COUNTS = {
+    "addresses": 12,
+    "categories": 5,
+    "inventory_movements": 18,
+    "order_items": 17,
+    "orders": 12,
+    "payments": 9,
+    "products": 8,
+    "reviews": 8,
+    "users": 10,
+}
+LEGACY_COUNTS = {
     "users": 3,
     "products": 4,
     "orders": 2,
@@ -79,6 +121,11 @@ class DemoVerification:
     product_count: int
     order_count: int
     order_item_count: int
+    category_count: int
+    address_count: int
+    payment_count: int
+    review_count: int
+    inventory_movement_count: int
     users_comment: str
     constraint_failures: tuple[str, ...]
 
@@ -143,6 +190,43 @@ def reset_demo(settings: Settings, *, confirm: bool) -> None:
     engine.dispose()
 
 
+def upgrade_demo_showcase(settings: Settings) -> DemoVerification:
+    """Add the classroom showcase tables and data without dropping existing demo data."""
+
+    require_demo_database(settings)
+    engine = create_demo_engine(settings)
+    try:
+        with engine.begin() as connection:
+            _assert_current_database(connection)
+            if _table_names(connection) != LEGACY_TABLES:
+                raise DemoAlreadyInitialized(
+                    "Showcase upgrade requires the original four-table demo and refuses "
+                    "to modify any other schema state."
+                )
+            legacy_counts = {
+                table: connection.execute(
+                    text(f"SELECT count(*) FROM bookstore.{table}")
+                ).scalar_one()
+                for table in LEGACY_COUNTS
+            }
+            if legacy_counts != LEGACY_COUNTS or _foreign_keys(connection) != (
+                ("order_items", "order_items_order_fk", "orders", "id"),
+                ("order_items", "order_items_product_fk", "products", "id"),
+                ("orders", "orders_user_fk", "users", "id"),
+            ):
+                raise DemoAlreadyInitialized(
+                    "Showcase upgrade requires the verified original seed and relationships."
+                )
+            _execute_allowlisted(
+                connection,
+                read_sql_file("showcase_upgrade.sql"),
+                ("CREATE", "ALTER", "UPDATE", "INSERT", "SELECT"),
+            )
+            return _verify_connection(connection)
+    finally:
+        engine.dispose()
+
+
 def _assert_current_database(connection) -> None:
     current = connection.execute(text("SELECT current_database()")).scalar_one()
     if current != DEMO_DATABASE_NAME:
@@ -189,6 +273,21 @@ def _verify_connection(connection) -> DemoVerification:
     if foreign_keys != EXPECTED_FOREIGN_KEYS:
         raise DemoVerificationError("Bookstore foreign keys do not match the packaged schema.")
     counts = {
+        "addresses": connection.execute(
+            text("SELECT count(*) FROM bookstore.addresses")
+        ).scalar_one(),
+        "categories": connection.execute(
+            text("SELECT count(*) FROM bookstore.categories")
+        ).scalar_one(),
+        "inventory_movements": connection.execute(
+            text("SELECT count(*) FROM bookstore.inventory_movements")
+        ).scalar_one(),
+        "payments": connection.execute(
+            text("SELECT count(*) FROM bookstore.payments")
+        ).scalar_one(),
+        "reviews": connection.execute(
+            text("SELECT count(*) FROM bookstore.reviews")
+        ).scalar_one(),
         "users": connection.execute(text("SELECT count(*) FROM bookstore.users")).scalar_one(),
         "products": connection.execute(
             text("SELECT count(*) FROM bookstore.products")
@@ -233,6 +332,11 @@ def _verify_connection(connection) -> DemoVerification:
         product_count=counts["products"],
         order_count=counts["orders"],
         order_item_count=counts["order_items"],
+        category_count=counts["categories"],
+        address_count=counts["addresses"],
+        payment_count=counts["payments"],
+        review_count=counts["reviews"],
+        inventory_movement_count=counts["inventory_movements"],
         users_comment=comment,
         constraint_failures=failures,
     )

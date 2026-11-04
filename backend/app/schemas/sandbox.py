@@ -2,10 +2,11 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 SandboxResult = Literal["passed", "failed", "rejected"]
 CheckStatus = Literal["passed", "failed", "not_run"]
+CheckpointSessionState = Literal["ready", "running", "completed", "recovery_required"]
 
 
 class SandboxCheck(BaseModel):
@@ -20,6 +21,7 @@ class SandboxRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     confirm: bool
+    snapshot_session_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
 
 
 class SandboxRun(BaseModel):
@@ -40,4 +42,21 @@ class SandboxRun(BaseModel):
     cleaned_up: bool
     checks: list[SandboxCheck]
     observed_tables: list[str]
+    error: str | None = None
+    snapshot_session_id: str | None = None
+    pre_migration_snapshot_verified: bool = False
+
+
+class SandboxCheckpointSessionStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    active: bool
+    migration_id: str | None = None
+    snapshot_session_id: str | None = None
+    state: CheckpointSessionState | None = None
+    checkpoint_verified: bool = False
+    restore_status: str | None = None
+    validation_run: SandboxRun | None = None
+    baseline_evidence: dict[str, object] | None = None
+    downgrade_report: dict[str, object] | None = None
     error: str | None = None

@@ -4,11 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.schemas.operation_kinds import (
-    ClarificationTopic,
-    ConstraintRequestKind,
-    OperationKind,
-)
+from app.schemas.planning import ClarificationTopic, ConstraintRequestKind, OperationKind
 
 InterpretationPath = Literal["deterministic", "llm_assisted", "deterministic_fallback"]
 ProviderStatus = Literal[

@@ -1,11 +1,13 @@
 import type {
   ApprovalSummary,
+  AuthSession,
   HealthResponse,
   MigrationArtifact,
   MigrationProposal,
   RiskAssessment,
   RollbackReport,
   SafetyReport,
+  SandboxCheckpointSessionStatus,
   SandboxRun,
   SchemaSnapshot,
   SourceListResponse,
@@ -15,13 +17,23 @@ import type {
 import { ApiError, type ApiErrorBody } from "./types";
 
 const SOURCE = "bookstore-demo";
+const MIGRATION_SOURCE = "sandbox";
+let csrfToken: string | null = null;
+
+export function setCsrfToken(value: string | null): void {
+  csrfToken = value;
+}
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const method = (init?.method ?? "GET").toUpperCase();
   const response = await fetch(path, {
     ...init,
     headers: {
       Accept: "application/json",
       ...(init?.body ? { "Content-Type": "application/json" } : {}),
+      ...(csrfToken && !["GET", "HEAD", "OPTIONS"].includes(method)
+        ? { "X-CSRF-Token": csrfToken }
+        : {}),
       ...init?.headers,
     },
   });
@@ -50,6 +62,20 @@ export function getHealth(signal?: AbortSignal): Promise<HealthResponse> {
   return requestJson<HealthResponse>("/api/v1/health", { signal });
 }
 
+export function getAuthSession(signal?: AbortSignal): Promise<AuthSession> {
+  return requestJson<AuthSession>("/api/v1/auth/me", { signal });
+}
+
+export function beginLogin(): void {
+  window.location.assign("/api/v1/auth/login");
+}
+
+export async function endSession(): Promise<AuthSession> {
+  const session = await requestJson<AuthSession>("/api/v1/auth/logout", { method: "POST" });
+  setCsrfToken(null);
+  return session;
+}
+
 export function listSources(signal?: AbortSignal): Promise<SourceListResponse> {
   return requestJson<SourceListResponse>("/api/v1/sources", { signal });
 }
@@ -62,14 +88,14 @@ export function createPlan(
   request: string,
   useLlm = false,
 ): Promise<MigrationProposal> {
-  return requestJson<MigrationProposal>(`/api/v1/sources/${SOURCE}/plans`, {
+  return requestJson<MigrationProposal>(`/api/v1/sources/${MIGRATION_SOURCE}/plans`, {
     method: "POST",
     body: JSON.stringify({ request, use_llm: useLlm }),
   });
 }
 
 export function assessRisk(request: string, useLlm = false): Promise<RiskAssessment> {
-  return requestJson<RiskAssessment>(`/api/v1/sources/${SOURCE}/risk`, {
+  return requestJson<RiskAssessment>(`/api/v1/sources/${MIGRATION_SOURCE}/risk`, {
     method: "POST",
     body: JSON.stringify({ request, use_llm: useLlm }),
   });
@@ -79,7 +105,7 @@ export function createArtifact(
   request: string,
   useLlm = false,
 ): Promise<MigrationArtifact> {
-  return requestJson<MigrationArtifact>(`/api/v1/sources/${SOURCE}/artifacts`, {
+  return requestJson<MigrationArtifact>(`/api/v1/sources/${MIGRATION_SOURCE}/artifacts`, {
     method: "POST",
     body: JSON.stringify({ request, use_llm: useLlm }),
   });
@@ -87,7 +113,7 @@ export function createArtifact(
 
 export function runSandbox(migrationId: string, confirm: boolean): Promise<SandboxRun> {
   return requestJson<SandboxRun>(
-    `/api/v1/sources/${SOURCE}/artifacts/${migrationId}/sandbox`,
+    `/api/v1/sources/${MIGRATION_SOURCE}/artifacts/${migrationId}/sandbox`,
     {
       method: "POST",
       body: JSON.stringify({ confirm }),
@@ -95,12 +121,36 @@ export function runSandbox(migrationId: string, confirm: boolean): Promise<Sandb
   );
 }
 
-export function runRollback(migrationId: string, confirm: boolean): Promise<RollbackReport> {
+export function getSandboxCheckpointSession(): Promise<SandboxCheckpointSessionStatus> {
+  return requestJson<SandboxCheckpointSessionStatus>(
+    `/api/v1/sources/${MIGRATION_SOURCE}/sandbox-session`,
+  );
+}
+
+export function runRollback(
+  migrationId: string,
+  confirm: boolean,
+  snapshotSessionId: string,
+): Promise<RollbackReport> {
   return requestJson<RollbackReport>(
-    `/api/v1/sources/${SOURCE}/artifacts/${migrationId}/rollback`,
+    `/api/v1/sources/${MIGRATION_SOURCE}/artifacts/${migrationId}/rollback`,
     {
       method: "POST",
-      body: JSON.stringify({ confirm }),
+      body: JSON.stringify({ confirm, snapshot_session_id: snapshotSessionId }),
+    },
+  );
+}
+
+export function runDowngrade(
+  migrationId: string,
+  confirm: boolean,
+  snapshotSessionId: string,
+): Promise<RollbackReport> {
+  return requestJson<RollbackReport>(
+    `/api/v1/sources/${MIGRATION_SOURCE}/artifacts/${migrationId}/downgrade`,
+    {
+      method: "POST",
+      body: JSON.stringify({ confirm, snapshot_session_id: snapshotSessionId }),
     },
   );
 }
@@ -110,12 +160,13 @@ export function createSafetyReport(
   request: string,
   confirm: boolean,
   useLlm = false,
+  snapshotSessionId?: string,
 ): Promise<SafetyReport> {
   return requestJson<SafetyReport>(
-    `/api/v1/sources/${SOURCE}/artifacts/${migrationId}/report`,
+    `/api/v1/sources/${MIGRATION_SOURCE}/artifacts/${migrationId}/report`,
     {
       method: "POST",
-      body: JSON.stringify({ request, confirm, use_llm: useLlm }),
+      body: JSON.stringify({ request, confirm, use_llm: useLlm, snapshot_session_id: snapshotSessionId }),
     },
   );
 }
@@ -125,12 +176,14 @@ export function persistWorkflow(
   request: string,
   confirm: boolean,
   useLlm = false,
+  visibility: "shared" | "private" = "shared",
+  snapshotSessionId?: string,
 ): Promise<WorkflowDetail> {
   return requestJson<WorkflowDetail>(
-    `/api/v1/sources/${SOURCE}/artifacts/${migrationId}/workflows`,
+    `/api/v1/sources/${MIGRATION_SOURCE}/artifacts/${migrationId}/workflows`,
     {
       method: "POST",
-      body: JSON.stringify({ request, confirm, use_llm: useLlm }),
+      body: JSON.stringify({ request, confirm, use_llm: useLlm, visibility, snapshot_session_id: snapshotSessionId }),
     },
   );
 }

@@ -10,6 +10,7 @@ from app.schemas.domain import SourceListResponse, SourceSummary
 
 BOOKSTORE_SOURCE_ID = "bookstore-demo"
 BOOKSTORE_SCHEMA_NAME = "bookstore"
+SANDBOX_SOURCE_ID = "sandbox"
 
 
 class SourceNotFoundError(LookupError):

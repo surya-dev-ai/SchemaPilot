@@ -8,8 +8,8 @@ from app.db import session as session_module
 from app.main import create_app
 from app.schemas.artifacts import MigrationArtifact, OperationReversibility
 from app.schemas.planning import Assumption, MigrationProposal, PlanOperation
-from app.schemas.report import SafetyReport
-from app.schemas.rollback import BaselineEvidence, RollbackReport
+from app.schemas.report import BaselineEvidenceSummary, SafetyReport
+from app.schemas.rollback import BaselineEvidence, RollbackReport, SnapshotRecoveryReport
 from app.schemas.sandbox import SandboxRun
 from app.schemas.workflow import ApprovalCreateRequest
 from app.services.report_service import build_safety_report
@@ -46,13 +46,22 @@ def _settings(*, authentication_available: bool = False) -> Settings:
         target_execution_enabled=False,
         allow_app_migrations=False,
         authentication_available=authentication_available,
+        auth_admin_roles="admin",
+        auth_engineer_roles="engineer",
+        auth_approver_roles="approver",
+        auth_viewer_roles="viewer",
+        auth_team_groups="team",
     )
 
 
-def _principal():
+def _principal(
+    identity: str = "reviewer@example.test",
+    roles: tuple[str, ...] = ("approver",),
+    groups: tuple[str, ...] = ("team",),
+):
     from app.services.auth import AuthenticatedPrincipal
 
-    return AuthenticatedPrincipal(identity="reviewer@example.test", scheme="test")
+    return AuthenticatedPrincipal(identity=identity, scheme="test", roles=roles, groups=groups)
 
 
 def _engine(tmp_path: Path):
@@ -160,6 +169,30 @@ def _rollback(status: str = "partial_restoration") -> RollbackReport:
         downgrade_executed=True,
         schema_matches_baseline=True,
         data_checks=[],
+        snapshot_recovery=SnapshotRecoveryReport(
+            checkpoint_id="a" * 32,
+            backup_status="verified",
+            restore_status="restore_verified",
+            baseline_schema_fingerprint="fingerprint-1",
+            restored_schema_fingerprint="fingerprint-1",
+            baseline_data_fingerprint="data-fingerprint",
+            restored_data_fingerprint="data-fingerprint",
+            schema_match=True,
+            data_match=True,
+            checkpoint_retained=True,
+        ),
+        preexisting_sandbox_recovery=SnapshotRecoveryReport(
+            checkpoint_id="b" * 32,
+            backup_status="verified",
+            restore_status="restore_verified",
+            baseline_schema_fingerprint="fingerprint-1",
+            restored_schema_fingerprint="fingerprint-1",
+            baseline_data_fingerprint="preexisting-data-fingerprint",
+            restored_data_fingerprint="preexisting-data-fingerprint",
+            schema_match=True,
+            data_match=True,
+            checkpoint_retained=True,
+        ),
         data_loss_limitations=[
             "Recreating a dropped column does not restore its former values."
         ],
@@ -232,6 +265,48 @@ def test_persist_and_list_workflows(tmp_path: Path) -> None:
     assert listed.workflows[0].id == detail.id
 
 
+def test_workflow_history_retains_sandbox_evidence_after_reload(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    proposal, assessment, report, rollback = _eligible_bundle()
+    report = report.model_copy(
+        update={
+            "sandbox": report.sandbox.model_copy(
+                update={
+                    "snapshot_session_id": "f" * 32,
+                    "pre_migration_snapshot_verified": True,
+                }
+            ),
+            "baseline_evidence": BaselineEvidenceSummary(
+                schema_fingerprint=report.schema_fingerprint,
+                tables=["users"],
+                row_counts={"users": 3},
+            ),
+            "downgrade_executed": True,
+            "snapshot_session_id": "f" * 32,
+        }
+    )
+    rollback = rollback.model_copy(
+        update={"snapshot_session_id": "f" * 32, "artifact_checksum": report.artifact_checksum}
+    )
+    detail = persist_workflow(
+        _settings(),
+        proposal=proposal,
+        assessment=assessment,
+        report=report,
+        rollback=rollback,
+        engine=engine,
+    )
+
+    loaded = get_workflow(_settings(), detail.id, engine=engine)
+
+    assert loaded.report.sandbox is not None
+    assert loaded.report.sandbox.snapshot_session_id == "f" * 32
+    assert loaded.report.baseline_evidence is not None
+    assert loaded.report.baseline_evidence.tables == ["users"]
+    assert loaded.report.downgrade_executed is True
+    assert loaded.report.snapshot_session_id == "f" * 32
+
+
 def test_duplicate_artifact_binding_is_rejected(tmp_path: Path) -> None:
     engine = _engine(tmp_path)
     proposal, assessment, report, rollback = _eligible_bundle()
@@ -250,6 +325,66 @@ def test_duplicate_artifact_binding_is_rejected(tmp_path: Path) -> None:
             assessment=assessment,
             report=report,
             rollback=rollback,
+            engine=engine,
+        )
+    assert exc.value.code == "duplicate_workflow_artifact"
+
+
+def test_blocked_local_workflow_can_refresh_to_reviewable_evidence(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    proposal, assessment, report, rollback = _eligible_bundle()
+    blocked_report = report.model_copy(update={"eligible_for_review": False})
+    original = persist_workflow(
+        _settings(),
+        proposal=proposal,
+        assessment=assessment,
+        report=blocked_report,
+        rollback=rollback,
+        engine=engine,
+    )
+    assert original.state == "blocked"
+
+    refreshed = persist_workflow(
+        _settings(),
+        proposal=proposal,
+        assessment=assessment,
+        report=report,
+        rollback=rollback,
+        engine=engine,
+    )
+
+    assert refreshed.id == original.id
+    assert refreshed.state == "report_ready"
+    assert refreshed.eligible_for_review is True
+    assert refreshed.artifact_applied is False
+    assert refreshed.report.approved is False
+    assert refreshed.report.applied is False
+    assert any(
+        event.event_type == "workflow_evidence_refreshed" for event in refreshed.audit_events
+    )
+
+
+def test_authenticated_mode_does_not_refresh_duplicate_workflow(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    proposal, assessment, report, rollback = _eligible_bundle()
+    blocked_report = report.model_copy(update={"eligible_for_review": False})
+    persist_workflow(
+        _settings(),
+        proposal=proposal,
+        assessment=assessment,
+        report=blocked_report,
+        rollback=rollback,
+        engine=engine,
+    )
+
+    with pytest.raises(WorkflowStoreError) as exc:
+        persist_workflow(
+            _settings(authentication_available=True),
+            proposal=proposal,
+            assessment=assessment,
+            report=report,
+            rollback=rollback,
+            principal=_principal(),
             engine=engine,
         )
     assert exc.value.code == "duplicate_workflow_artifact"
@@ -369,6 +504,87 @@ def test_approval_requires_matching_artifact_report_and_valid_target(tmp_path: P
     loaded = get_workflow(_settings(), detail.id, engine=engine)
     assert loaded.state == "approval_recorded"
     assert loaded.report.applied is False
+
+
+def test_private_workflows_are_visible_only_to_their_owner(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    settings = _settings(authentication_available=True)
+    owner_a = _principal("subject-a", ("engineer",))
+    owner_b = _principal("subject-b", ("engineer",))
+    proposal, assessment, report, rollback = _eligible_bundle()
+
+    private_a = persist_workflow(
+        settings,
+        proposal=proposal,
+        assessment=assessment,
+        report=report.model_copy(update={"artifact_checksum": "sha256:private-a"}),
+        rollback=rollback,
+        principal=owner_a,
+        visibility="private",
+        engine=engine,
+    )
+    private_b = persist_workflow(
+        settings,
+        proposal=proposal,
+        assessment=assessment,
+        report=report.model_copy(update={"artifact_checksum": "sha256:private-b"}),
+        rollback=rollback,
+        principal=owner_b,
+        visibility="private",
+        engine=engine,
+    )
+    team = persist_workflow(
+        settings,
+        proposal=proposal,
+        assessment=assessment,
+        report=report.model_copy(update={"artifact_checksum": "sha256:team"}),
+        rollback=rollback,
+        principal=owner_a,
+        visibility="shared",
+        engine=engine,
+    )
+
+    visible = list_workflows(settings, engine=engine, principal=owner_a).workflows
+    assert {item.id for item in visible} == {private_a.id, team.id}
+    assert private_a.visibility == "private"
+    assert team.visibility == "shared"
+    non_team = _principal("subject-non-team", ("engineer",), ())
+    isolated = list_workflows(settings, engine=engine, principal=non_team).workflows
+    assert isolated == []
+    with pytest.raises(WorkflowStoreError) as team_hidden:
+        get_workflow(settings, team.id, engine=engine, principal=non_team)
+    assert team_hidden.value.code == "workflow_not_found"
+    with pytest.raises(WorkflowStoreError) as hidden:
+        get_workflow(settings, private_b.id, engine=engine, principal=owner_a)
+    assert hidden.value.code == "workflow_not_found"
+
+
+def test_workflow_owner_cannot_approve_their_own_workflow(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    settings = _settings(authentication_available=True)
+    owner = _principal("subject-owner", ("approver", "engineer"))
+    proposal, assessment, report, rollback = _eligible_bundle()
+    detail = persist_workflow(
+        settings,
+        proposal=proposal,
+        assessment=assessment,
+        report=report,
+        rollback=rollback,
+        principal=owner,
+        visibility="shared",
+        engine=engine,
+    )
+
+    with pytest.raises(WorkflowStoreError) as rejected:
+        record_approval(
+            settings,
+            detail.id,
+            ApprovalCreateRequest(target_identity="staging-target", confirm=True),
+            principal=owner,
+            engine=engine,
+        )
+
+    assert rejected.value.code == "self_approval_forbidden"
 
 
 def test_incomplete_evidence_cannot_be_approved(tmp_path: Path) -> None:

@@ -1,4 +1,4 @@
-"""Read-only inspection of the bookstore schema.
+"""Read-only inspection of configured bookstore and sandbox schemas.
 
 Catalog comments, defaults, and check expressions are returned as text.
 They are never executed.
@@ -13,8 +13,15 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError
 
-from app.core.config import DEMO_DATABASE_NAME, Settings
-from app.db.session import create_bookstore_source_engine
+from app.core.config import (
+    DEMO_DATABASE_NAME,
+    SANDBOX_DATABASE_NAME,
+    SANDBOX_DATABASE_USER,
+    Settings,
+    UnsafeDatabaseConfigurationError,
+    require_sandbox_execution,
+)
+from app.db.session import create_bookstore_source_engine, create_sandbox_engine
 from app.schemas.domain import (
     ColumnSnapshot,
     ConstraintKind,
@@ -31,6 +38,8 @@ from app.schemas.domain import (
 from app.services.source_manager import (
     BOOKSTORE_SCHEMA_NAME,
     BOOKSTORE_SOURCE_ID,
+    SANDBOX_SOURCE_ID,
+    SourceNotConfiguredError,
     SourceNotReadOnlyError,
     SourceUnavailableError,
     UnexpectedSourceDatabaseError,
@@ -170,6 +179,41 @@ def inspect_source(settings: Settings, source_id: str) -> SchemaSnapshot:
         engine.dispose()
 
 
+def inspect_sandbox(settings: Settings) -> SchemaSnapshot:
+    """Inspect only the configured sandbox, in an explicitly read-only transaction."""
+
+    try:
+        require_sandbox_execution(settings)
+    except UnsafeDatabaseConfigurationError:
+        raise SourceNotConfiguredError from None
+    engine = create_sandbox_engine(settings)
+    try:
+        with engine.connect() as connection:
+            connection.exec_driver_sql("SET TRANSACTION READ ONLY")
+            current_database, current_user, read_only = connection.execute(
+                text(
+                    "SELECT current_database(), current_user, "
+                    "current_setting('transaction_read_only')"
+                )
+            ).one()
+            if (
+                current_database != SANDBOX_DATABASE_NAME
+                or current_user != SANDBOX_DATABASE_USER
+                or str(read_only).lower() != "on"
+            ):
+                raise UnexpectedSourceDatabaseError
+            catalog = load_catalog(connection)
+            return assemble_snapshot(
+                catalog,
+                source_id=SANDBOX_SOURCE_ID,
+                database_name=SANDBOX_DATABASE_NAME,
+            )
+    except OperationalError:
+        raise SourceUnavailableError from None
+    finally:
+        engine.dispose()
+
+
 def load_catalog(connection: Connection) -> Catalog:
     params = {"schema": BOOKSTORE_SCHEMA_NAME}
     return Catalog(
@@ -180,7 +224,12 @@ def load_catalog(connection: Connection) -> Catalog:
     )
 
 
-def assemble_snapshot(catalog: Catalog) -> SchemaSnapshot:
+def assemble_snapshot(
+    catalog: Catalog,
+    *,
+    source_id: str = BOOKSTORE_SOURCE_ID,
+    database_name: str = DEMO_DATABASE_NAME,
+) -> SchemaSnapshot:
     """Build a deterministic snapshot. Comments stay in metadata fields."""
 
     columns_by_table: dict[str, list[ColumnSnapshot]] = {}
@@ -228,8 +277,8 @@ def assemble_snapshot(catalog: Catalog) -> SchemaSnapshot:
         for row in sorted(catalog.tables, key=lambda item: str(item["table_name"]))
     ]
     snapshot = SchemaSnapshot(
-        source_id=BOOKSTORE_SOURCE_ID,
-        database_name=DEMO_DATABASE_NAME,
+        source_id=source_id,
+        database_name=database_name,
         schema_name=BOOKSTORE_SCHEMA_NAME,
         tables=tables,
         dependencies=dependencies,

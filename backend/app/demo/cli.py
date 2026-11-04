@@ -9,15 +9,19 @@ from app.demo.bookstore import (
     initialize_demo,
     reset_demo,
     seed_demo,
+    upgrade_demo_showcase,
     verify_demo,
 )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Initialize, seed, verify, or reset the disposable bookstore demo."
+        description="Manage the disposable bookstore demo and its additive classroom showcase."
     )
-    parser.add_argument("command", choices=("init", "seed", "verify", "reset"))
+    parser.add_argument(
+        "command",
+        choices=("init", "seed", "verify", "reset", "showcase-upgrade"),
+    )
     parser.add_argument(
         "--confirm-demo-reset",
         action="store_true",
@@ -47,6 +51,18 @@ def main(argv: list[str] | None = None) -> int:
             report = verify_demo(settings)
             print(
                 "Bookstore demo verified: "
+                f"{report.user_count} users, {report.product_count} products, "
+                f"{report.order_count} orders, {report.order_item_count} order items, "
+                f"{report.category_count} categories, {report.address_count} addresses, "
+                f"{report.payment_count} payments, {report.review_count} reviews, "
+                f"{report.inventory_movement_count} inventory movements; "
+                f"{len(report.foreign_keys)} relationships."
+            )
+        elif args.command == "showcase-upgrade":
+            report = upgrade_demo_showcase(settings)
+            print(
+                "Added the bookstore classroom showcase without resetting existing data: "
+                f"{len(report.tables)} tables, {len(report.foreign_keys)} relationships, "
                 f"{report.user_count} users, {report.product_count} products, "
                 f"{report.order_count} orders, {report.order_item_count} order items."
             )

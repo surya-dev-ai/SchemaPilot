@@ -19,6 +19,7 @@ The SQL preview and the Alembic module are rendered from the same validated oper
 | Non-unique index | `CREATE INDEX` and `op.create_index` | `DROP INDEX` and `op.drop_index` | `reversible`. Row values stay in place |
 | Rename column | `RENAME COLUMN` and `op.alter_column` | Rename back to the previous name | `reversible`. Dependent snapshot ids are recorded |
 | Rename table | `RENAME TO` and `op.rename_table` | Rename back to the previous name | `reversible`. Dependent snapshot ids are recorded |
+| Drop one existing column from `bookstore-demo` | `DROP COLUMN` and `op.drop_column` | Re-add the column as nullable | `partially_reversible`; stored values, original nullability, and dependent constraints are not recovered |
 
 Identifiers are accepted only when they match `^[a-z_][a-z0-9_]*$`, then quoted. Supported column types are `text`, `integer`, `bigint`, `boolean`, and `timestamptz`.
 
@@ -26,7 +27,7 @@ Identifiers are accepted only when they match `^[a-z_][a-z0-9_]*$`, then quoted.
 
 | Result | Code |
 | --- | --- |
-| Any `policy_blocked` finding, including drops | `policy_blocked` |
+| Policy-blocked operation except the narrow sandbox-only column-drop preview described below | `policy_blocked` |
 | Any `data_check` of `not_run` | `data_check_not_run` |
 | Plan status is not `proposed` | `plan_not_proposed` |
 | Proposed plan with no operations | `no_operations` |
@@ -35,6 +36,10 @@ Identifiers are accepted only when they match `^[a-z_][a-z0-9_]*$`, then quoted.
 | Output path is inside `backend/alembic/versions` | `unsafe_to_generate` |
 
 A low static score is not treated as a passed live row check. `not_run` stays unresolved.
+
+### Destructive column review boundary
+
+A single validated `DROP COLUMN` proposal may produce an artifact only for source `bookstore-demo` and schema `bookstore`. The artifact is marked `sandbox_only=true`; its risk assessment remains `policy_blocked`, and this does not grant target eligibility or approval. The sandbox parser accepts only the exact quoted `ALTER TABLE ... DROP COLUMN ...;` form without `CASCADE`. Table drops, multi-operation destructive plans, and other policy-blocked operations remain rejected. The generated downgrade recreates a nullable column of the original supported type; it cannot restore prior values, original nullability, or dependent objects, which must remain visible as partial recovery in rollback evidence.
 
 ## Checksum
 

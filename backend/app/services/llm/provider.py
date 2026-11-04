@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Protocol
+from urllib.parse import urlparse
 
 from pydantic import ValidationError
 
@@ -30,6 +32,10 @@ class LlmProviderResult:
     provider_name: str
 
 
+class _StructuredOutputRejected(Exception):
+    """The endpoint rejected the JSON Schema response format itself."""
+
+
 class LlmProvider(Protocol):
     name: str
 
@@ -38,73 +44,6 @@ class LlmProvider(Protocol):
         request_text: str,
         snapshot: SchemaSnapshot,
     ) -> LlmProviderResult: ...
-
-
-_FORBIDDEN_TOP_LEVEL = frozenset(
-    {
-        "sql",
-        "upgrade_sql",
-        "downgrade_sql",
-        "connection_string",
-        "database_url",
-        "target_identity",
-        "api_key",
-        "password",
-        "executable",
-    }
-)
-_OPERATION_ALIASES = {
-    "action": "kind",
-    "operation": "kind",
-    "operation_kind": "kind",
-    "table_name": "table",
-    "column_name": "column",
-    "new_table_name": "new_name",
-    "new_column_name": "new_name",
-    "type": "data_type",
-    "datatype": "data_type",
-}
-
-
-def normalize_provider_dict(data: dict[str, Any]) -> dict[str, Any]:
-    """Map common provider aliases onto the strict SchemaPilot draft schema."""
-
-    normalized: dict[str, Any] = dict(data)
-    questions = normalized.get("clarification_questions")
-    if isinstance(questions, list):
-        fixed: list[Any] = []
-        for item in questions:
-            if isinstance(item, str):
-                text = item.strip()
-                if text:
-                    fixed.append({"topic": "behavior", "text": text})
-            elif isinstance(item, dict):
-                fixed.append(item)
-        normalized["clarification_questions"] = fixed
-    operations = normalized.get("operations")
-    if isinstance(operations, list):
-        fixed_ops: list[Any] = []
-        for item in operations:
-            if not isinstance(item, dict):
-                fixed_ops.append(item)
-                continue
-            op = dict(item)
-            for alias, canonical in _OPERATION_ALIASES.items():
-                if alias in op and canonical not in op:
-                    op[canonical] = op.pop(alias)
-                elif alias in op:
-                    op.pop(alias)
-            if op.get("index_columns") is None:
-                op["index_columns"] = []
-            fixed_ops.append(op)
-        normalized["operations"] = fixed_ops
-    if normalized.get("assumptions") is None:
-        normalized["assumptions"] = []
-    if normalized.get("clarification_questions") is None:
-        normalized["clarification_questions"] = []
-    if normalized.get("operations") is None:
-        normalized["operations"] = []
-    return normalized
 
 
 def parse_provider_json(raw: str | bytes | dict[str, Any]) -> LlmInterpretationPayload:
@@ -119,23 +58,82 @@ def parse_provider_json(raw: str | bytes | dict[str, Any]) -> LlmInterpretationP
         data = raw
     if not isinstance(data, dict):
         raise LlmProviderError("malformed", "Provider JSON must be an object.")
-    present = _FORBIDDEN_TOP_LEVEL.intersection(data)
+    # Explicitly refuse common dangerous keys even before pydantic extra=forbid.
+    forbidden = {
+        "sql",
+        "upgrade_sql",
+        "downgrade_sql",
+        "connection_string",
+        "database_url",
+        "target_identity",
+        "api_key",
+        "password",
+        "executable",
+    }
+    present = forbidden.intersection(data)
     if present:
         raise LlmProviderError(
             "malformed",
             f"Provider response included forbidden fields: {sorted(present)}.",
         )
-    normalized = normalize_provider_dict(data)
     try:
-        return LlmInterpretationPayload.model_validate(normalized)
+        return LlmInterpretationPayload.model_validate(data)
     except ValidationError as exc:
-        raise LlmProviderError("malformed", "Provider response failed schema validation.") from exc
+        reason = _validation_error_summary(exc)
+        raise LlmProviderError(
+            "malformed",
+            f"Provider response failed schema validation: {reason}.",
+        ) from exc
+
+
+def _validation_error_summary(error: ValidationError) -> str:
+    """Summarize structural issues without exposing provider values or raw output."""
+
+    safe_fields = {
+        "schema_fingerprint",
+        "summary",
+        "assumptions",
+        "clarification_questions",
+        "operations",
+        "topic",
+        "text",
+        "kind",
+        "table",
+        "column",
+        "data_type",
+        "nullable",
+        "default",
+        "new_name",
+        "index_columns",
+        "constraint_kind",
+        "check_expression",
+        "destructive",
+    }
+    summaries: list[str] = []
+    for item in error.errors()[:3]:
+        path = ".".join(
+            str(part)
+            for part in item.get("loc", ())
+            if isinstance(part, str) and part in safe_fields
+        )
+        error_type = item.get("type")
+        if error_type == "missing":
+            detail = f"missing required field {path}" if path else "missing required field"
+        elif error_type == "extra_forbidden":
+            detail = "contains an unexpected field"
+        else:
+            detail = f"invalid value for {path}" if path else "invalid field value"
+        if detail not in summaries:
+            summaries.append(detail)
+    return "; ".join(summaries) or "the response shape was invalid"
 
 
 class OpenAICompatibleProvider:
     """HTTP chat completions provider. Uses stdlib urllib; no secret logging."""
 
     name = "openai_compatible"
+    api_key_header = "Authorization"
+    api_key_prefix = "Bearer "
 
     def __init__(self, settings: Settings) -> None:
         self._api_key = (settings.llm_api_key or "").strip()
@@ -154,12 +152,27 @@ class OpenAICompatibleProvider:
         body = {
             "model": self._model,
             "temperature": 0,
-            "response_format": {"type": "json_object"},
+            "response_format": _structured_response_format(),
             "messages": [
                 {"role": "system", "content": system_prompt()},
                 {"role": "user", "content": user_prompt(request_text, context)},
             ],
         }
+        try:
+            raw = self._post_completion(body)
+        except _StructuredOutputRejected:
+            # Some OpenAI-compatible deployments support JSON mode but not strict
+            # structured outputs. Keep the server-side Pydantic validation either way.
+            body["response_format"] = {"type": "json_object"}
+            raw = self._post_completion(body)
+        try:
+            envelope = json.loads(raw)
+            content = envelope["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            raise LlmProviderError("malformed", "Provider envelope was malformed.") from exc
+        return LlmProviderResult(payload=parse_provider_json(content), provider_name=self.name)
+
+    def _post_completion(self, body: dict[str, Any]) -> str:
         payload = json.dumps(body).encode("utf-8")
         request = urllib.request.Request(
             f"{self._base}/chat/completions",
@@ -167,7 +180,7 @@ class OpenAICompatibleProvider:
             method="POST",
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {self._api_key}",
+                self.api_key_header: f"{self.api_key_prefix}{self._api_key}",
             },
         )
         try:
@@ -176,6 +189,12 @@ class OpenAICompatibleProvider:
         except TimeoutError as exc:
             raise LlmProviderError("timeout", "LLM provider timed out.") from exc
         except urllib.error.HTTPError as exc:
+            if (
+                exc.code == 400
+                and body.get("response_format", {}).get("type") == "json_schema"
+                and _response_format_rejected(exc)
+            ):
+                raise _StructuredOutputRejected from None
             if exc.code == 429:
                 raise LlmProviderError(
                     "rate_limited",
@@ -187,12 +206,101 @@ class OpenAICompatibleProvider:
             if isinstance(reason, TimeoutError):
                 raise LlmProviderError("timeout", "LLM provider timed out.") from exc
             raise LlmProviderError("error", "LLM provider request failed.") from exc
-        try:
-            envelope = json.loads(raw)
-            content = envelope["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-            raise LlmProviderError("malformed", "Provider envelope was malformed.") from exc
-        return LlmProviderResult(payload=parse_provider_json(content), provider_name=self.name)
+        return raw
+
+
+class AzureOpenAIProvider(OpenAICompatibleProvider):
+    """Azure OpenAI v1 chat completions using an Azure resource API key."""
+
+    name = "azure_openai"
+    api_key_header = "api-key"
+    api_key_prefix = ""
+
+    def __init__(self, settings: Settings) -> None:
+        base = urlparse(settings.llm_api_base)
+        host = (base.hostname or "").casefold()
+        azure_host = host.endswith(".openai.azure.com") or host.endswith(".services.ai.azure.com")
+        if (
+            base.scheme != "https"
+            or not azure_host
+            or not base.path.rstrip("/").endswith("/openai/v1")
+            or base.query
+            or base.fragment
+        ):
+            raise LlmProviderError(
+                "not_configured",
+                "Azure OpenAI requires an HTTPS Azure v1 endpoint ending in /openai/v1.",
+            )
+        super().__init__(settings)
+
+
+def _response_format_rejected(error: urllib.error.HTTPError) -> bool:
+    """Recognize format-related 400s without logging or exposing provider details."""
+
+    try:
+        error_body = json.loads(error.read().decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, OSError):
+        return False
+    detail = error_body.get("error", {}) if isinstance(error_body, dict) else {}
+    if not isinstance(detail, dict):
+        return False
+    parameter = str(detail.get("param", "")).casefold()
+    code = str(detail.get("code", "")).casefold()
+    message = str(detail.get("message", "")).casefold()
+    return (
+        parameter.startswith("response_format")
+        or "response_format" in message
+        or "json_schema" in code
+    )
+
+
+def _structured_response_format() -> dict[str, Any]:
+    """Ask supported OpenAI-compatible models to follow our exact output contract."""
+
+    schema = LlmInterpretationPayload.model_json_schema()
+    definitions = schema.pop("$defs", {})
+
+    def normalize(node: Any) -> Any:
+        if isinstance(node, list):
+            return [normalize(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+        reference = node.get("$ref")
+        if isinstance(reference, str) and reference.startswith("#/$defs/"):
+            definition_name = reference.rsplit("/", 1)[-1]
+            expanded = deepcopy(definitions[definition_name])
+            expanded.update({key: value for key, value in node.items() if key != "$ref"})
+            return normalize(expanded)
+
+        result = {
+            key: normalize(value)
+            for key, value in node.items()
+            if key
+            not in {
+                "title",
+                "description",
+                "default",
+                # Azure structured outputs reject these JSON Schema keywords;
+                # Pydantic still enforces them after parsing the model response.
+                "minLength",
+                "maxLength",
+                "maxItems",
+            }
+        }
+        if node.get("type") == "object":
+            properties = node.get("properties", {})
+            result["required"] = list(properties)
+            result["additionalProperties"] = False
+        return result
+
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "migration_interpretation",
+            "strict": True,
+            "schema": normalize(schema),
+        },
+    }
 
 
 class CallableProvider:
@@ -225,4 +333,6 @@ def build_provider(settings: Settings, override: LlmProvider | None = None) -> L
     provider_name = (settings.llm_provider or "openai_compatible").strip().lower()
     if provider_name in {"openai", "openai_compatible"}:
         return OpenAICompatibleProvider(settings)
+    if provider_name == "azure_openai":
+        return AzureOpenAIProvider(settings)
     raise LlmProviderError("error", f"Unsupported LLM provider '{provider_name}'.")

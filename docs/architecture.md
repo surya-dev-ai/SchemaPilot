@@ -59,7 +59,7 @@ The API can list the bookstore source and return a fingerprinted snapshot of sch
 
 ## Phase 8
 
-`POST /api/v1/sources/bookstore-demo/artifacts/{migration_id}/rollback` downgrades that artifact only after the sandbox upgrade passes. The safety report is `POST /api/v1/sources/bookstore-demo/artifacts/{migration_id}/report`. `eligible_for_review`, `approved`, `applied`, and `fully_reversible` are separate fields. See `docs/rollback.md`.
+The sandbox-validation endpoint checkpoints the existing sandbox before it rebuilds the known bookstore baseline and returns a session ID. `POST /api/v1/sources/bookstore-demo/artifacts/{migration_id}/rollback` consumes that artifact-bound session, tests the downgrade, and restores both the prepared baseline and original pre-validation state. The safety-report endpoint reads saved evidence for the same session and does not repeat destructive sandbox work. `eligible_for_review`, `approved`, `applied`, and `fully_reversible` are separate fields. See `docs/rollback.md`.
 
 ## Phase 9
 

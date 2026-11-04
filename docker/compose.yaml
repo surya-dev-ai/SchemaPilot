@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: ${SCHEMAPILOT_APP_DB_PASSWORD:-change_me_local_app}
       POSTGRES_DB: ${SCHEMAPILOT_APP_DB_NAME:-schemapilot}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5435:5432"
     volumes:
       - schemapilot_app_data:/var/lib/postgresql/data
     healthcheck:
@@ -24,7 +24,7 @@ services:
       POSTGRES_PASSWORD: ${SCHEMAPILOT_DEMO_DB_PASSWORD:-change_me_local_demo}
       POSTGRES_DB: ${SCHEMAPILOT_DEMO_DB_NAME:-schemapilot_bookstore}
     ports:
-      - "5434:5432"
+      - "127.0.0.1:5434:5432"
     volumes:
       - schemapilot_demo_data:/var/lib/postgresql/data
     healthcheck:
@@ -41,7 +41,7 @@ services:
       POSTGRES_PASSWORD: ${SCHEMAPILOT_SANDBOX_DB_PASSWORD:-change_me_local_sandbox}
       POSTGRES_DB: ${SCHEMAPILOT_SANDBOX_DB_NAME:-schemapilot_sandbox}
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
       - schemapilot_sandbox_data:/var/lib/postgresql/data
     healthcheck:

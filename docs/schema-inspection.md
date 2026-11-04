@@ -38,7 +38,7 @@ If the demo is not selected, `GET /api/v1/sources` shows `configured: false`. Re
 
 `GET /api/v1/sources/bookstore-demo/schema`
 
-The response lists `order_items`, `orders`, `products`, and `users` in that order. Columns, constraints, and indexes are ordered inside each table. `fingerprint` is a SHA-256 hash of the canonical JSON snapshot, excluding the fingerprint field itself. The same schema produces the same fingerprint.
+The bookstore showcase response lists `addresses`, `categories`, `inventory_movements`, `order_items`, `orders`, `payments`, `products`, `reviews`, and `users` in that order. Columns, constraints, and indexes are ordered inside each table. `fingerprint` is a SHA-256 hash of the canonical JSON snapshot, excluding the fingerprint field itself. The same schema produces the same fingerprint.
 
 ```json
 {

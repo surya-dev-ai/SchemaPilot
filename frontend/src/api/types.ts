@@ -19,6 +19,14 @@ export type HealthResponse = {
   phase: string;
 };
 
+export type AuthSession = {
+  enabled: boolean;
+  authenticated: boolean;
+  can_access_team_workspace: boolean;
+  user: { email: string | null; display_name: string | null; roles: string[] } | null;
+  csrf_token: string | null;
+};
+
 export type SourceSummary = {
   id: string;
   kind: "demo";
@@ -193,6 +201,7 @@ export type MigrationArtifact = {
   summary: string;
   status: "generated";
   applied: false;
+  sandbox_only?: boolean;
   operation_ids: string[];
   sql_preview: string;
   downgrade_sql: string;
@@ -233,6 +242,25 @@ export type SandboxRun = {
   checks: SandboxCheck[];
   observed_tables: string[];
   error: string | null;
+  snapshot_session_id: string | null;
+  pre_migration_snapshot_verified: boolean;
+};
+
+export type SandboxCheckpointSessionStatus = {
+  active: boolean;
+  migration_id: string;
+  snapshot_session_id: string | null;
+  state: "ready" | "running" | "completed" | "recovery_required" | null;
+  checkpoint_verified: boolean;
+  restore_status: string | null;
+  validation_run: SandboxRun | null;
+  baseline_evidence: {
+    schema_fingerprint: string;
+    tables: string[];
+    row_counts: Record<string, number>;
+  } | null;
+  downgrade_report: Record<string, unknown> | null;
+  error: string | null;
 };
 
 export type RollbackStatus =
@@ -265,6 +293,31 @@ export type RollbackReport = {
   data_checks: SandboxCheck[];
   data_loss_limitations: string[];
   error: string | null;
+  snapshot_recovery: SnapshotRecoveryReport | null;
+  preexisting_sandbox_recovery?: SnapshotRecoveryReport | null;
+  snapshot_session_id: string | null;
+};
+
+export type SnapshotRecoveryReport = {
+  checkpoint_id: string | null;
+  captured_at: string | null;
+  backup_status: "verified" | "failed" | "unavailable" | "not_created";
+  restore_status:
+    | "restore_verified"
+    | "restore_partially_verified"
+    | "restore_failed"
+    | "verification_incomplete"
+    | "backup_unavailable"
+    | "not_attempted";
+  baseline_schema_fingerprint: string | null;
+  restored_schema_fingerprint: string | null;
+  baseline_data_fingerprint: string | null;
+  restored_data_fingerprint: string | null;
+  schema_match: boolean | null;
+  data_match: boolean | null;
+  verification_checks: SandboxCheck[];
+  checkpoint_retained: boolean;
+  error: string | null;
 };
 
 export type SafetyReport = {
@@ -279,7 +332,16 @@ export type SafetyReport = {
   artifact_status: string;
   risk_findings: RiskFinding[];
   sandbox: SandboxRun | null;
+  baseline_evidence: {
+    schema_fingerprint: string;
+    tables: string[];
+    row_counts: Record<string, number>;
+  } | null;
+  downgrade_executed: boolean;
   rollback_status: RollbackStatus;
+  snapshot_recovery: SnapshotRecoveryReport | null;
+  preexisting_sandbox_recovery?: SnapshotRecoveryReport | null;
+  snapshot_session_id: string | null;
   data_loss_limitations: string[];
   missing_evidence: string[];
   blocking_reasons: string[];
@@ -295,6 +357,7 @@ export type WorkflowSummary = {
   migration_id: string;
   artifact_checksum: string;
   schema_fingerprint: string;
+  visibility: "shared" | "private";
   state: "report_ready" | "approval_recorded" | "blocked";
   eligible_for_review: boolean;
   report_stale: boolean;
@@ -331,6 +394,7 @@ export type WorkflowDetail = {
   artifact_status: string;
   artifact_applied: false;
   schema_fingerprint: string;
+  visibility: "shared" | "private";
   state: "report_ready" | "approval_recorded" | "blocked";
   report_checksum: string;
   evidence_fingerprint: string;

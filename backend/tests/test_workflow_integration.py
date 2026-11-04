@@ -6,6 +6,7 @@ They do not run Alembic and do not open the source or sandbox databases.
 """
 
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from app.core.config import Settings, UnsafeDatabaseConfigurationError, resolve_app_database_url
@@ -64,7 +65,7 @@ def test_live_app_database_persists_a_workflow(app_db_settings: Settings, tmp_pa
         proposal, assessment, report, rollback = _eligible_bundle()
         # Use a unique checksum so repeated local runs do not collide.
         unique = report.model_copy(
-            update={"artifact_checksum": f"sha256:live-{Path(report.migration_id).name}-workflow"}
+            update={"artifact_checksum": f"sha256:live-{uuid4().hex}-workflow"}
         )
         unique_rollback = rollback.model_copy(
             update={"artifact_checksum": unique.artifact_checksum}

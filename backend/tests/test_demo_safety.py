@@ -120,12 +120,18 @@ def test_packaged_sql_contains_the_bookstore_contract() -> None:
         for statement in schema_statements
         if statement.lstrip().upper().startswith("CREATE TABLE")
     ]
-    assert len(table_statements) == 4
+    assert len(table_statements) == 9
     assert comment_statements == [
         "COMMENT ON TABLE bookstore.users IS '" + USER_TABLE_COMMENT + "'"
     ]
     assert all(not statement.lstrip().upper().startswith("DROP") for statement in schema_statements)
     assert all(not statement.lstrip().upper().startswith("DROP") for statement in seed_statements)
+    upgrade_statements = split_sql_script(read_sql_file("showcase_upgrade.sql"))
+    assert all(
+        not statement.lstrip().upper().startswith("DROP") for statement in upgrade_statements
+    )
+    assert any("products_category_fk" in statement for statement in upgrade_statements)
+    assert any("inventory_movements_order_item_fk" in statement for statement in upgrade_statements)
     seed_text = "\n".join(seed_statements)
     assert "mira@example.test" in seed_text
     assert "SKU-RARE-003" in seed_text

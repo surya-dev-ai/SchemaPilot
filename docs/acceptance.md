@@ -1,5 +1,7 @@
 # Phase 12 acceptance report
 
+> Historical checkpoint from the Phase 12 baseline. Environment availability and test counts below predate the OIDC implementation and latest test runs. Current auth setup is documented in `docs/authentication.md`; current verification is tracked in `todo.md`.
+
 Honest final validation of SchemaPilot Phases 1–11. Target execution was **not** enabled.
 
 ## Environment availability
@@ -7,10 +9,9 @@ Honest final validation of SchemaPilot Phases 1–11. Target execution was **not
 | Capability | Status |
 | --- | --- |
 | Backend venv / pytest / Ruff | Available |
-| Node.js / npm | Available (Node v24). Frontend `npm test` / `npm run build` **passed** in a later run |
-| Docker / disposable PostgreSQL | CLI installed; **Desktop engine not running** → live integration still skipped |
-| Live Azure OpenAI | Wired in `backend/.env`; manual smoke returned `llm_assisted` / `ok` |
-| Authentication | **Low priority**; remains unavailable; approvals fail closed |
+| Node.js / npm | **Not on PATH**; common install locations missing; frontend tests/build **not run** |
+| Docker / disposable PostgreSQL | **Not available**; live integration tests **skipped** |
+| Live LLM provider | Opt-in test remains skipped by default |
 
 Commands used to probe tooling:
 
@@ -66,8 +67,9 @@ Frontend `npm test` and `npm run build` were **not run** (Node/npm unavailable).
 - Default: `authentication_available=false`.
 - `record_approval` rejects with `authentication_unavailable` unless a real principal is provided **and** the setting is true.
 - Request-body usernames / confirm checkboxes are not treated as authenticated identity.
-- No login provider, session store, or password flow is implemented.
-- Therefore **verified human approval is not available** in this environment.
+- Provider-agnostic OIDC Authorization Code login, signed session cookies, CSRF enforcement, and role gates have since been implemented.
+- OIDC remains off until the deployment configures a real provider and migrates the application metadata database.
+- **Verified human approval is not available in the current local configuration** while `authentication_available=false`.
 
 ## Target execution
 
@@ -81,7 +83,7 @@ Frontend `npm test` and `npm run build` were **not run** (Node/npm unavailable).
 
 ### Remaining blockers before any target apply
 
-1. Real authentication and authorization of approvers (tested end-to-end).
+1. Configure OIDC and verify role/group authorization with multiple real accounts.
 2. Live disposable PostgreSQL evidence for sandbox upgrade and rollback (`not_verified` must remain a blocker).
 3. Live application-database workflow persistence verification.
 4. Target URL isolation proven against distinct disposable target DB.
@@ -108,5 +110,5 @@ A successful schema downgrade does not imply data recovery.
 
 1. Install Node.js 20+ and run `cd frontend && npm install && npm test && npm run build`.
 2. Start disposable Compose databases; set distinct app/demo/sandbox URLs; run `pytest -m integration`.
-3. Implement a real auth provider; keep approvals attributed to verified principals only.
+3. Apply the new workflow visibility Alembic revision to the app database after backup/review.
 4. Only after the above, design a gated target-apply path that reuses `assert_target_execution_allowed` and never auto-downgrades a target.
